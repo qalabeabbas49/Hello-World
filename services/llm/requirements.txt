@@ -1,0 +1,5 @@
+# vLLM is installed in the base image (vllm/vllm-openai).
+# This file documents the Python packages used by the benchmark load-tester
+# when talking to the LLM service.
+aiohttp==3.10.5
+openai==1.42.0

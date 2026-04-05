@@ -1,0 +1,19 @@
+# Benchmark results (not committed — can be large)
+results/*.json
+results/*.jsonl
+results/*.md
+
+# Generated fixtures (regenerate with `make fixtures`)
+fixtures/audio/*.wav
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# Docker volumes
+models/

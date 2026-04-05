@@ -1,0 +1,12 @@
+[
+  {
+    "description": "Type 2 diabetes, chest pain workup",
+    "transcript": "DOCTOR: Good morning. What brings you in today?\nPATIENT: I've been having chest pain radiating to my left arm for the past three days.\nDOCTOR: Any nausea, shortness of breath?\nPATIENT: Some nausea, no fever. I've also been more tired than usual.\nDOCTOR: Current medications?\nPATIENT: Metformin 1000mg twice daily, lisinopril 10mg once daily.\nDOCTOR: Allergies?\nPATIENT: Penicillin.\nDOCTOR: Vitals: BP 138/88, HR 82 bpm, SpO2 97%.\nLungs clear bilaterally. Heart regular, no murmurs.\nDOCTOR: Assessment: Atypical chest pain, rule out ACS. Plan: 12-lead EKG now, troponin levels, aspirin 325mg, cardiology referral.",
+    "expected_output_sections": ["Subjective", "Objective", "Assessment", "Plan"]
+  },
+  {
+    "description": "COPD exacerbation",
+    "transcript": "DOCTOR: What's going on today?\nPATIENT: My breathing has been worse for the past 5 days. I can't walk to the mailbox without getting winded.\nDOCTOR: Any fever, increased sputum, change in color?\nPATIENT: Low-grade fever yesterday, sputum is more yellow-green than usual.\nDOCTOR: Medications?\nPATIENT: Tiotropium inhaler daily, albuterol as needed, fluticasone/salmeterol.\nDOCTOR: Vitals: BP 144/92, HR 102, RR 22, SpO2 91% on room air, Temp 37.8°C.\nWheeze on auscultation bilaterally. Prolonged expiratory phase.\nDOCTOR: COPD exacerbation, moderate. Start prednisone 40mg taper 5 days, azithromycin 500mg, increase albuterol nebs. Chest X-ray ordered.",
+    "expected_output_sections": ["Subjective", "Objective", "Assessment", "Plan"]
+  }
+]

@@ -4,7 +4,17 @@ results/*.jsonl
 results/*.md
 
 # Generated fixtures (regenerate with `make fixtures`)
-fixtures/audio/*.wav
+fixtures/audio/**/*.wav
+fixtures/audio/**/*.flac
+fixtures/audio/**/*.ogg
+fixtures/audio/**/*.opus
+# Real audio files — add your own; they are not committed
+fixtures/real_audio/*.wav
+fixtures/real_audio/*.flac
+fixtures/real_audio/*.ogg
+fixtures/real_audio/*.opus
+fixtures/real_audio/*.mp3
+fixtures/real_audio/**
 
 # Python
 __pycache__/

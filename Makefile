@@ -15,21 +15,24 @@
 
 .PHONY: help fixtures check-gpu \
         up-whisper up-llm up-mixed down \
-        bench-whisper bench-llm bench-e2e bench-compare bench-all \
+        bench-whisper bench-llm bench-e2e bench-compare bench-formats bench-real-audio bench-all \
         report clean
 
 # ── Configurable defaults ──────────────────────────────────────────────────────
-MODEL    ?= large-v2
-BACKEND  ?= faster_whisper
-WORKERS  ?= 16
-RESULTS  ?= ./results
-SESSIONS ?=
-CHUNKS   ?=
+MODEL          ?= large-v2
+BACKEND        ?= faster_whisper
+WORKERS        ?= 16
+RESULTS        ?= ./results
+SESSIONS       ?=
+CHUNKS         ?=
+FORMATS        ?= wav,flac,opus
+RATES          ?= 16000,48000
+REAL_AUDIO_DIR ?= ./fixtures/real_audio
 
 help:
 	@echo ""
 	@echo "  Fixtures & checks"
-	@echo "    make fixtures              Generate 20 × 47s synthetic WAV files"
+	@echo "    make fixtures              Generate synthetic audio: WAV/FLAC/Opus at 16k+48k"
 	@echo "    make check-gpu             Verify GPU driver, Docker GPU access"
 	@echo ""
 	@echo "  Service management"
@@ -42,19 +45,27 @@ help:
 	@echo "    make bench-whisper         One backend × one model  (BACKEND=, MODEL=)"
 	@echo "    make bench-llm             LLM concurrency sweep"
 	@echo "    make bench-e2e             E2E session sweep"
-	@echo "    make bench-compare         Both backends × ALL model sizes  [main sweep]"
-	@echo "    make bench-all             bench-compare + bench-llm + bench-e2e"
+	@echo "    make bench-compare         Both backends × ALL model sizes  [main concurrency sweep]"
+	@echo "    make bench-formats         WAV/FLAC/Opus × 16k/48k format sweep (synthetic)"
+	@echo "    make bench-real-audio      Same sweep with your own audio files (REAL_AUDIO_DIR=)"
+	@echo "    make bench-all             bench-compare + bench-formats + bench-llm + bench-e2e"
 	@echo ""
 	@echo "  Results"
 	@echo "    make report                Re-render report.md from saved JSON results"
 	@echo "    make clean                 Delete result files (keeps fixtures)"
 	@echo ""
-	@echo "  Variables:  BACKEND=$(BACKEND)  MODEL=$(MODEL)  WORKERS=$(WORKERS)  RESULTS=$(RESULTS)"
+	@echo "  Key variables:"
+	@echo "    BACKEND=$(BACKEND)  MODEL=$(MODEL)  WORKERS=$(WORKERS)"
+	@echo "    FORMATS=$(FORMATS)  RATES=$(RATES)"
+	@echo "    REAL_AUDIO_DIR=$(REAL_AUDIO_DIR)  RESULTS=$(RESULTS)"
 
 # ── Fixtures & preflight ───────────────────────────────────────────────────────
+# Generates subdirs:  fixtures/audio/wav_16000/  wav_48000/  flac_16000/  …
 fixtures:
-	@mkdir -p fixtures/audio
-	python -m generators.audio_gen --count 20 --duration 47 --output ./fixtures/audio
+	python -m generators.audio_gen \
+	  --count 20 --duration 47 \
+	  --formats $(FORMATS) --sample-rates $(RATES) \
+	  --output ./fixtures/audio
 
 check-gpu:
 	@bash scripts/setup_gpu_isolation.sh
@@ -113,13 +124,34 @@ bench-compare:
 	@echo ""
 	@echo "Comparison complete. Report: $(RESULTS)/report.md"
 
-# Full suite: compare + LLM + E2E
+# Format + sample rate sweep (synthetic audio, Whisper-only service)
+bench-formats:
+	$(MAKE) up-whisper BACKEND=$(BACKEND) MODEL=$(MODEL) WORKERS=$(WORKERS)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode format \
+	  --audio-formats $(FORMATS) --audio-rates $(RATES) \
+	  --output $(RESULTS)
+	$(MAKE) down
+
+# Same sweep with real audio files (service must be running or will be started by up-whisper)
+bench-real-audio:
+	$(MAKE) up-whisper BACKEND=$(BACKEND) MODEL=$(MODEL) WORKERS=$(WORKERS)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode format \
+	  --audio-formats $(FORMATS) --audio-rates $(RATES) \
+	  --real-audio-dir $(REAL_AUDIO_DIR) \
+	  --output $(RESULTS)
+	$(MAKE) down
+
+# Full suite: compare + formats + LLM + E2E
 bench-all:
 	@mkdir -p $(RESULTS)
 	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
 	  --mode all --workers $(WORKERS) \
+	  --audio-formats $(FORMATS) --audio-rates $(RATES) \
 	  $(if $(SESSIONS),--sessions $(SESSIONS),) \
 	  $(if $(CHUNKS),--chunks $(CHUNKS),) \
+	  $(if $(wildcard $(REAL_AUDIO_DIR)),--real-audio-dir $(REAL_AUDIO_DIR),) \
 	  --output $(RESULTS)
 	@echo ""
 	@echo "Full suite complete. Report: $(RESULTS)/report.md"

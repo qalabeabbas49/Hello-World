@@ -25,19 +25,54 @@ import soundfile as sf
 logger = logging.getLogger(__name__)
 
 
-# ── Common audio loading ───────────────────────────────────────────────────────
+# ── Common audio loading ──────────────────────────────────────────────────────
+
+def _load_via_ffmpeg(audio_bytes: bytes) -> np.ndarray:
+    """
+    Decode audio bytes using ffmpeg — handles formats soundfile can't:
+    Opus (.opus / .ogg), WebM, MP3, M4A, AAC, etc.
+    ffmpeg outputs raw float32 LE PCM at 16 kHz mono directly.
+    """
+    import subprocess
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "quiet",
+            "-i", "pipe:0",
+            "-f", "f32le",      # float32 little-endian raw PCM
+            "-ac", "1",         # mono
+            "-ar", "16000",     # 16 kHz (Whisper-native; avoids double-resample)
+            "pipe:1",
+        ],
+        input=audio_bytes,
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(result.stdout, dtype=np.float32).copy()
+
 
 def _load_audio(audio_bytes: bytes) -> np.ndarray:
-    """Decode audio bytes → float32 mono numpy array at 16 kHz."""
-    arr, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
-    if arr.ndim > 1:
-        arr = arr.mean(axis=1)
-    # Resample to 16 kHz if needed (soundfile reads at native rate)
-    if sr != 16_000:
-        import scipy.signal as sig
-        n_samples = int(len(arr) * 16_000 / sr)
-        arr = sig.resample(arr, n_samples).astype(np.float32)
-    return arr
+    """
+    Decode any audio format → float32 mono numpy array at 16 kHz.
+
+    Strategy:
+    1. Try soundfile first (fast; supports WAV, FLAC, OGG Vorbis, AIFF…).
+    2. Fall back to ffmpeg for formats soundfile can't handle
+       (Opus, WebM, MP3, M4A, AAC…).
+    3. Resample to 16 kHz if soundfile decoded at a different rate
+       (e.g. 48 kHz browser capture).
+    """
+    try:
+        arr, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        if sr != 16_000:
+            import scipy.signal as sig_resamp
+            n_out = int(len(arr) * 16_000 / sr)
+            arr   = sig_resamp.resample(arr, n_out).astype(np.float32)
+        return arr
+    except Exception:
+        # soundfile failed (Opus, WebM, etc.) — delegate to ffmpeg
+        return _load_via_ffmpeg(audio_bytes)
 
 
 # ── Base class ────────────────────────────────────────────────────────────────

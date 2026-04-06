@@ -61,6 +61,23 @@ CHUNKS_PER_SESSION = 13     # 13 × 47s ≈ 10-minute appointment
 
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-oss-20b")
 
+# ── Audio format + sample rate sweep ─────────────────────────────────────────
+# Formats to test in the format benchmark
+_raw_fmts = os.getenv("AUDIO_FORMATS", "wav,flac,opus")
+AUDIO_FORMATS = [f.strip() for f in _raw_fmts.split(",") if f.strip()]
+
+# Sample rates to test (Hz)
+_raw_rates = os.getenv("AUDIO_SAMPLE_RATES", "16000,48000")
+AUDIO_SAMPLE_RATES = [int(r.strip()) for r in _raw_rates.split(",") if r.strip()]
+
+# Concurrency used in the format sweep (fixed — isolates format overhead from scaling)
+FORMAT_BENCH_CONCURRENCY = int(os.getenv("FORMAT_BENCH_CONCURRENCY", "10"))
+
+# Directory for real audio files provided by the user
+# Sub-folders named  <fmt>_<rate>/  are auto-detected (e.g. wav_16000/)
+# Flat folder also works — format inferred from extension, rate from ffprobe
+REAL_AUDIO_DIR = os.getenv("REAL_AUDIO_DIR", "./fixtures/real_audio")
+
 # ── Output ────────────────────────────────────────────────────────────────────
 RESULTS_DIR      = os.getenv("RESULTS_DIR",     "./results")
 GPU_METRICS_FILE = os.getenv("GPU_METRICS_FILE", "./results/gpu_metrics.jsonl")

@@ -264,10 +264,11 @@ def generate_report(
         "2. [Whisper Comparison Matrix](#whisper-comparison-matrix)",
         "3. [Whisper Detailed Results](#whisper-detailed-results)",
         "4. [VRAM Reference](#vram-reference)",
-        "5. [LLM Throughput](#llm-throughput)",
-        "6. [End-to-End Pipeline](#end-to-end-pipeline)",
-        "7. [Capacity Projections](#capacity-projections)",
-        "8. [Methodology](#methodology)",
+        "5. [Audio Format & Sample Rate Matrix](#audio-format--sample-rate-matrix)",
+        "6. [LLM Throughput](#llm-throughput)",
+        "7. [End-to-End Pipeline](#end-to-end-pipeline)",
+        "8. [Capacity Projections](#capacity-projections)",
+        "9. [Methodology](#methodology)",
         "",
         "---",
         "",
@@ -361,6 +362,80 @@ def generate_report(
         "",
         "---\n",
     ]
+
+    # ── Audio format / sample rate matrix ────────────────────────────────────
+    lines.append("## Audio Format & Sample Rate Matrix\n")
+    lines += [
+        "> Fixed concurrency = 10. Measures decoding overhead and resampling cost per format.",
+        "> **16 kHz** = Whisper-native (no resampling). **48 kHz** = browser/mic capture path (requires service resampling).",
+        "",
+    ]
+    fmt_results = all_results.get("format", {})
+    if fmt_results:
+        for source_label, source_data in [("Synthetic Audio", fmt_results.get("synthetic", {})),
+                                          ("Real Audio",      fmt_results.get("real",      {}))]:
+            if not source_data:
+                continue
+            lines.append(f"### {source_label}\n")
+            for metric, col_hdr, fmt_fn in [
+                ("p50",  "p50 latency (ms)", _fmt_ms),
+                ("p95",  "p95 latency (ms)", _fmt_ms),
+                ("rps",  "req/s",            lambda v: f"{float(v):.2f}" if v != "—" else "—"),
+                ("err",  "error %",          lambda v: f"{float(v):.1f}%" if v != "—" else "—"),
+            ]:
+                # Collect all rates that appear in data
+                all_rates: list[int] = sorted({
+                    int(r)
+                    for fmt_data in source_data.values()
+                    if isinstance(fmt_data, dict)
+                    for r in fmt_data.keys()
+                    if r.isdigit()
+                })
+                if not all_rates:
+                    continue
+                rate_labels = [f"{r//1000}kHz" for r in all_rates]
+                headers = ["Format"] + rate_labels
+                rows = []
+                for fmt_key in sorted(source_data.keys()):
+                    fmt_data = source_data[fmt_key]
+                    if not isinstance(fmt_data, dict):
+                        continue
+                    row = [f"`{fmt_key}`"]
+                    for rate in all_rates:
+                        res = fmt_data.get(str(rate), {})
+                        if not isinstance(res, dict) or res.get("skipped"):
+                            row.append("—")
+                            continue
+                        lm = res.get("latency_ms", {})
+                        if metric == "p50":
+                            row.append(fmt_fn(_get(lm, "p50")))
+                        elif metric == "p95":
+                            row.append(fmt_fn(_get(lm, "p95")))
+                        elif metric == "rps":
+                            row.append(fmt_fn(_get(res, "throughput_rps")))
+                        elif metric == "err":
+                            row.append(fmt_fn(_get(res, "error_rate_pct")))
+                    rows.append(row)
+                if rows:
+                    lines += [
+                        f"**{col_hdr}** — lower is better"
+                        if metric in ("p50", "p95", "err")
+                        else f"**{col_hdr}** — higher is better",
+                        "",
+                        _md_table(headers, rows),
+                        "",
+                    ]
+        lines += [
+            "> Latency delta (48kHz vs 16kHz) = resampling overhead added by the service.",
+            "> Latency delta (flac/opus vs wav) = decoding overhead (FLAC ≈ 0–5 ms, Opus ≈ 5–15 ms via ffmpeg).",
+            "",
+        ]
+    else:
+        lines += [
+            "_No format results. Run `make bench-formats` or add `--mode format` to run_all._",
+            "",
+        ]
+    lines.append("---\n")
 
     # ── LLM results ───────────────────────────────────────────────────────────
     lines.append("## LLM Throughput\n")

@@ -153,9 +153,9 @@ async def run_compare_suite(
 async def main() -> None:
     parser = argparse.ArgumentParser(description="GPU Stress Test Runner")
     parser.add_argument("--mode",
-        choices=["whisper", "llm", "e2e", "compare", "all"],
+        choices=["whisper", "llm", "e2e", "compare", "format", "all"],
         default="all",
-        help="Benchmark mode")
+        help="Benchmark mode: 'format' tests WAV/FLAC/Opus at 16k/48k")
     parser.add_argument("--model",   default="large-v2",       help="Model for --mode whisper")
     parser.add_argument("--backend", default="faster_whisper", help="Backend for --mode whisper")
     parser.add_argument("--sessions",default=None,             help="Comma-separated E2E session counts")
@@ -163,6 +163,12 @@ async def main() -> None:
     parser.add_argument("--workers", type=int, default=16,     help="WHISPER_WORKERS for compare mode")
     parser.add_argument("--no-docker", action="store_true",
         help="Skip docker compose management (service already running)")
+    parser.add_argument("--real-audio-dir", default=None,
+        help="Path to real audio files folder (for --mode format)")
+    parser.add_argument("--audio-formats", default=None,
+        help="Comma-separated formats for format bench (default: wav,flac,opus)")
+    parser.add_argument("--audio-rates", default=None,
+        help="Comma-separated sample rates for format bench (default: 16000,48000)")
     parser.add_argument("--output",  default=cfg.RESULTS_DIR,  help="Results output directory")
     args = parser.parse_args()
 
@@ -174,11 +180,15 @@ async def main() -> None:
         if args.sessions else None
     )
 
+    fmts  = [f.strip() for f in args.audio_formats.split(",")] if args.audio_formats else None
+    rates = [int(r.strip()) for r in args.audio_rates.split(",")]   if args.audio_rates   else None
+
     all_results: dict = {
         "whisper":         {},   # single backend/model run
         "whisper_compare": {},   # compare mode: both backends × all models
         "llm":             {},
         "e2e":             {},
+        "format":          {},   # format × sample_rate benchmark
     }
 
     # ── whisper (single backend/model) ────────────────────────────────────────
@@ -198,6 +208,35 @@ async def main() -> None:
             use_docker=not args.no_docker,
             workers=args.workers,
         )
+        _save_partial(all_results, args.output)
+
+    # ── format / real-audio ───────────────────────────────────────────────────
+    if args.mode in ("format", "all"):
+        from benchmarks.audio_format_bench import (
+            run_synthetic_format_bench, run_real_audio_bench,
+        )
+        print(f"\n{'='*62}\n Audio format + sample rate sweep\n{'='*62}")
+        if not await _check_service(cfg.WHISPER_URL, "Whisper"):
+            print("  ! Whisper not reachable — skipping format bench")
+        else:
+            synth = await run_synthetic_format_bench(
+                formats=fmts, sample_rates=rates,
+                concurrency=cfg.FORMAT_BENCH_CONCURRENCY,
+            )
+            all_results["format"]["synthetic"] = synth
+
+            real_dir = args.real_audio_dir or cfg.REAL_AUDIO_DIR
+            if Path(real_dir).exists():
+                print(f"\n  Real audio dir: {real_dir}")
+                real = await run_real_audio_bench(
+                    real_audio_dir=real_dir,
+                    formats=fmts, sample_rates=rates,
+                    concurrency=cfg.FORMAT_BENCH_CONCURRENCY,
+                )
+                all_results["format"]["real"] = real
+            else:
+                print(f"  (no real audio dir at {real_dir} — skipping real audio bench)")
+
         _save_partial(all_results, args.output)
 
     # ── llm ───────────────────────────────────────────────────────────────────

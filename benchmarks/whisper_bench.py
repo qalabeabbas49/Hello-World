@@ -24,7 +24,7 @@ import aiohttp
 
 from benchmarks import config as cfg
 from generators.audio_gen import generate_pool
-from metrics.collector import MetricsCollector, RequestRecord
+from metrics.collector import MetricsCollector, RequestRecord, set_gpu_label, clear_gpu_label
 
 
 async def _single_transcribe(
@@ -118,6 +118,7 @@ async def run_whisper_bench(
     results: dict[str, dict] = {}
     for concurrency in cfg.WHISPER_CONCURRENCY:
         print(f"\n  concurrency={concurrency}")
+        set_gpu_label(f"{label}_c{concurrency}")
         summary = await _run_concurrency_level(concurrency, audio_pool, label)
         # Stamp backend + model onto every result for the reporter
         summary["backend"] = backend
@@ -137,6 +138,7 @@ async def run_whisper_bench(
             print(f"  cooling down {cfg.COOLDOWN_S}s...")
             await asyncio.sleep(cfg.COOLDOWN_S)
 
+    clear_gpu_label()
     return results
 
 

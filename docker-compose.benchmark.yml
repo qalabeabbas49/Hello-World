@@ -1,0 +1,56 @@
+version: "3.9"
+
+# Benchmark client container — runs the Python benchmark suite against
+# already-running Whisper / LLM services.
+#
+# Usage:
+#   # Start services first
+#   make up-whisper MODEL=large-v2 WORKERS=16
+#
+#   # Then run a benchmark mode inside Docker
+#   BENCH_MODE=whisper docker compose -f docker-compose.benchmark.yml run --rm bench
+#   BENCH_MODE=compare docker compose -f docker-compose.benchmark.yml run --rm bench
+#   BENCH_MODE=format  docker compose -f docker-compose.benchmark.yml run --rm bench
+#   BENCH_MODE=all     docker compose -f docker-compose.benchmark.yml run --rm bench
+#
+# Or run directly on the host (no Docker needed for the benchmark client):
+#   python -m benchmarks.run_all --mode all --output ./results
+
+services:
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.benchmark
+    network_mode: host          # connect to Whisper/LLM on localhost:8001/8002
+    volumes:
+      - ./results:/app/results
+      - ./fixtures:/app/fixtures
+    environment:
+      # Service URLs (default: localhost; override for remote services)
+      WHISPER_URL:    ${WHISPER_URL:-http://localhost:8001}
+      LLM_URL:        ${LLM_URL:-http://localhost:8002}
+      RESULTS_DIR:    /app/results
+
+      # Benchmark mode: whisper | compare | format | llm | e2e | all
+      BENCH_MODE:     ${BENCH_MODE:-all}
+
+      # Whisper model + backend (used for labelling, not service config)
+      WHISPER_MODEL:  ${WHISPER_MODEL:-large-v2}
+      WHISPER_BACKEND: ${WHISPER_BACKEND:-faster_whisper}
+
+      # Audio format sweep options
+      AUDIO_FORMATS:  ${AUDIO_FORMATS:-wav,flac,opus}
+      AUDIO_SAMPLE_RATES: ${AUDIO_SAMPLE_RATES:-16000,48000}
+
+      # Real audio directory (mount your files at /app/real_audio)
+      REAL_AUDIO_DIR: ${REAL_AUDIO_DIR:-/app/real_audio}
+
+      # Optional: GPU label file path (shared with gpu_monitor sidecar)
+      LABEL_FILE:     /app/results/gpu_label.txt
+    command: >
+      python -m benchmarks.run_all
+        --mode ${BENCH_MODE:-all}
+        --model ${WHISPER_MODEL:-large-v2}
+        --backend ${WHISPER_BACKEND:-faster_whisper}
+        --output /app/results
+        --no-docker

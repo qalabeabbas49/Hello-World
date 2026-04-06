@@ -10,12 +10,37 @@ Design:
   post-hoc without needing pre-aggregated bins.
 """
 import asyncio
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+# ── GPU label helpers ─────────────────────────────────────────────────────────
+# Benchmark scripts call set_gpu_label() to annotate GPU metrics with the
+# current test phase. gpu_monitor reads the same file on every poll cycle.
+
+_GPU_LABEL_FILE = Path(os.getenv("LABEL_FILE", "/results/gpu_label.txt"))
+
+
+def set_gpu_label(label: str) -> None:
+    """Write the current benchmark phase label to the shared label file."""
+    try:
+        _GPU_LABEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _GPU_LABEL_FILE.write_text(label)
+    except Exception:
+        pass   # non-critical; silently ignore FS errors
+
+
+def clear_gpu_label() -> None:
+    """Clear the GPU label (end of a benchmark phase)."""
+    try:
+        _GPU_LABEL_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 @dataclass

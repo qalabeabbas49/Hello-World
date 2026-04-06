@@ -32,6 +32,21 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_MS", "500")) / 1000.0
 OUTPUT_FILE   = Path(os.getenv("OUTPUT_FILE", "/results/gpu_metrics.jsonl"))
 LABEL         = os.getenv("MONITOR_LABEL", "")
 
+# Optional label file — benchmark scripts write the current test phase here.
+# gpu_monitor reads it on each poll so GPU records are tagged with the active phase.
+# e.g.  echo "fw_large-v2_c50" > /results/gpu_label.txt
+LABEL_FILE    = Path(os.getenv("LABEL_FILE", "/results/gpu_label.txt"))
+
+
+def _read_label() -> str:
+    """Read dynamic label from file, falling back to the static LABEL env var."""
+    try:
+        return LABEL_FILE.read_text().strip() or LABEL
+    except FileNotFoundError:
+        return LABEL
+    except Exception:
+        return LABEL
+
 _SMI_QUERY = (
     "timestamp,index,name,"
     "utilization.gpu,utilization.memory,"
@@ -58,7 +73,7 @@ def _parse_line(line: str, ts: float) -> dict:
         "mem_clock_mhz": _safe_float(parts[9]),
         "power_w":       _safe_float(parts[10]),
         "temp_c":        _safe_float(parts[11]),
-        "label":         LABEL,
+        # label is injected by the caller after _parse_line() returns
     }
 
 
@@ -83,8 +98,10 @@ async def poll_forever() -> None:
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=3,
                 )
+                current_label = _read_label()
                 for raw_line in result.stdout.strip().splitlines():
                     record = _parse_line(raw_line, ts)
+                    record["label"] = current_label
                     fh.write(json.dumps(record) + "\n")
             except FileNotFoundError:
                 fh.write(json.dumps({"ts": ts, "error": "nvidia-smi not found"}) + "\n")

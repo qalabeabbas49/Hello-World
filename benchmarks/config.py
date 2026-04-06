@@ -38,6 +38,30 @@ WHISPER_MODEL_MAP = {
 # Both backends to test in the comparison sweep
 WHISPER_BACKENDS = ["faster_whisper", "openai_whisper"]
 
+# Compute types for faster-whisper (openai-whisper always uses fp16 via PyTorch)
+# float16        — full precision CTranslate2 (default, best accuracy)
+# int8_float16   — INT8 weights, FP16 activations: ~10-15% faster, <1% WER penalty
+# Set via --compute-types flag; default is float16 only.
+WHISPER_COMPUTE_TYPES = ["float16"]   # override with e.g. ["float16", "int8_float16"]
+
+# Recommended WHISPER_WORKERS per model size for a single H200 (141 GB VRAM).
+# Rule of thumb: workers = floor(available_vram / model_vram_per_instance)
+# Values below assume faster-whisper float16 with 70–80 GB available to Whisper
+# (remaining VRAM reserved for LLM in mixed mode or system headroom).
+# For Whisper-only mode (up to ~130 GB), multiply by ~1.6.
+WHISPER_WORKERS_RECOMMENDATION: dict[str, int] = {
+    "tiny":           48,   # ~0.15 GB/instance
+    "base":           32,   # ~0.29 GB/instance
+    "small":          16,   # ~0.93 GB/instance
+    "medium":          8,   # ~3.06 GB/instance
+    "large-v2":        4,   # ~6.17 GB/instance
+    "large-v3":        4,   # ~6.17 GB/instance
+    "large-v3-turbo": 8,   # ~3.10 GB/instance
+    # openai-whisper (PyTorch) uses slightly more VRAM per instance
+    "large":           4,   # ~6.4  GB/instance (large-v1 PyTorch)
+    "turbo":           8,   # ~3.3  GB/instance (large-v3-turbo PyTorch)
+}
+
 # ── Concurrency sweep levels ──────────────────────────────────────────────────
 # Whisper: concurrent 47-second audio chunks
 WHISPER_CONCURRENCY = [1, 5, 10, 20, 50, 100]

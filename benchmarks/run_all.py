@@ -44,13 +44,13 @@ async def _check_service(url: str, name: str, retries: int = 24, delay: float = 
     return False
 
 
-def _docker_up(backend: str, model: str, workers: int = 16) -> None:
-    """Start the Whisper-only compose with the given backend + model."""
+def _docker_up(backend: str, model: str, workers: int = 16, compute_type: str = "float16") -> None:
+    """Start the Whisper-only compose with the given backend + model + compute type."""
     env = {
         "WHISPER_BACKEND":       backend,
         "WHISPER_MODEL":         model,
         "WHISPER_WORKERS":       str(workers),
-        "WHISPER_COMPUTE_TYPE":  "float16",
+        "WHISPER_COMPUTE_TYPE":  compute_type,
     }
     import os
     full_env = {**os.environ, **env}
@@ -103,42 +103,53 @@ async def run_compare_suite(
     output_dir: str,
     use_docker: bool = True,
     workers: int = 16,
+    compute_types: list[str] | None = None,
 ) -> dict:
     """
-    Sweep both backends across all their supported models.
+    Sweep both backends across all their supported models (and optionally compute types).
     For each combination: optionally (re)start the Whisper container, run the bench, save partial.
 
     Args:
-        use_docker: If True, start/stop the Docker service per combination.
-                    If False, assumes the service is already running (useful for manual testing).
-        workers:    WHISPER_WORKERS for the Whisper-only compose.
+        use_docker:     If True, start/stop the Docker service per combination.
+                        If False, assumes the service is already running.
+        workers:        WHISPER_WORKERS for the Whisper-only compose.
+        compute_types:  List of CTranslate2 compute types to test for faster-whisper.
+                        e.g. ["float16", "int8_float16"].  openai-whisper always uses fp16.
+                        Defaults to cfg.WHISPER_COMPUTE_TYPES (["float16"]).
     """
-    # Flat results: {backend: {model: {concurrency: summary}}}
+    if compute_types is None:
+        compute_types = cfg.WHISPER_COMPUTE_TYPES
+
+    # Results: {backend: {model: {compute_type: {concurrency: summary}}}}
+    # For openai_whisper, compute_type is always "fp16" (keyed as "fp16").
     compare: dict = {"faster_whisper": {}, "openai_whisper": {}}
 
-    backend_model_pairs = [
-        ("faster_whisper", m) for m in cfg.FASTER_WHISPER_MODELS
-    ] + [
-        ("openai_whisper",  m) for m in cfg.OPENAI_WHISPER_MODELS
-    ]
+    # Build full sweep list: (backend, model, compute_type)
+    combos: list[tuple[str, str, str]] = []
+    for m in cfg.FASTER_WHISPER_MODELS:
+        for ct in compute_types:
+            combos.append(("faster_whisper", m, ct))
+    for m in cfg.OPENAI_WHISPER_MODELS:
+        combos.append(("openai_whisper", m, "fp16"))
 
-    total = len(backend_model_pairs)
-    for idx, (backend, model) in enumerate(backend_model_pairs, 1):
+    total = len(combos)
+    for idx, (backend, model, compute_type) in enumerate(combos, 1):
         print(f"\n{'='*62}")
-        print(f" [{idx}/{total}]  {backend}  /  {model}")
+        print(f" [{idx}/{total}]  {backend}  /  {model}  /  {compute_type}")
         print(f"{'='*62}")
 
         if use_docker:
             _docker_down()
-            _docker_up(backend, model, workers=workers)
+            _docker_up(backend, model, workers=workers, compute_type=compute_type)
 
-        if await _check_service(cfg.WHISPER_URL, f"{backend}/{model}", retries=24, delay=5):
+        svc_label = f"{backend}/{model}/{compute_type}"
+        if await _check_service(cfg.WHISPER_URL, svc_label, retries=24, delay=5):
             results = await run_whisper_suite(model, backend)
-            compare[backend][model] = results
+            compare[backend].setdefault(model, {})[compute_type] = results
         else:
-            compare[backend][model] = {"error": "service did not start"}
+            compare[backend].setdefault(model, {})[compute_type] = {"error": "service did not start"}
 
-        # Save checkpoint after each model
+        # Save checkpoint after each combo
         _save_partial({"whisper_compare": compare}, output_dir, "whisper_compare_partial.json")
 
         if use_docker:
@@ -161,6 +172,9 @@ async def main() -> None:
     parser.add_argument("--sessions",default=None,             help="Comma-separated E2E session counts")
     parser.add_argument("--chunks",  type=int, default=None,   help="Chunks per E2E session")
     parser.add_argument("--workers", type=int, default=16,     help="WHISPER_WORKERS for compare mode")
+    parser.add_argument("--compute-types", default=None,
+        help="Comma-separated compute types for faster-whisper (default: float16). "
+             "e.g. float16,int8_float16")
     parser.add_argument("--no-docker", action="store_true",
         help="Skip docker compose management (service already running)")
     parser.add_argument("--real-audio-dir", default=None,
@@ -180,8 +194,11 @@ async def main() -> None:
         if args.sessions else None
     )
 
-    fmts  = [f.strip() for f in args.audio_formats.split(",")] if args.audio_formats else None
-    rates = [int(r.strip()) for r in args.audio_rates.split(",")]   if args.audio_rates   else None
+    fmts         = [f.strip() for f in args.audio_formats.split(",")]  if args.audio_formats  else None
+    rates        = [int(r.strip()) for r in args.audio_rates.split(",")]  if args.audio_rates    else None
+    compute_types = [c.strip() for c in args.compute_types.split(",")]  if args.compute_types  else None
+    if compute_types:
+        cfg.WHISPER_COMPUTE_TYPES = compute_types
 
     all_results: dict = {
         "whisper":         {},   # single backend/model run
@@ -207,6 +224,7 @@ async def main() -> None:
             output_dir=args.output,
             use_docker=not args.no_docker,
             workers=args.workers,
+            compute_types=compute_types,
         )
         _save_partial(all_results, args.output)
 
@@ -216,6 +234,14 @@ async def main() -> None:
             run_synthetic_format_bench, run_real_audio_bench,
         )
         print(f"\n{'='*62}\n Audio format + sample rate sweep\n{'='*62}")
+
+        # In --mode all, compare already tore down Docker — restart Whisper
+        # using large-v2 as the reference model for the format sweep.
+        use_docker = not args.no_docker
+        if args.mode == "all" and use_docker:
+            _docker_down()
+            _docker_up("faster_whisper", args.model, workers=args.workers)
+
         if not await _check_service(cfg.WHISPER_URL, "Whisper"):
             print("  ! Whisper not reachable — skipping format bench")
         else:
@@ -236,6 +262,10 @@ async def main() -> None:
                 all_results["format"]["real"] = real
             else:
                 print(f"  (no real audio dir at {real_dir} — skipping real audio bench)")
+
+        if args.mode == "all" and use_docker:
+            _docker_down()
+            await asyncio.sleep(5)
 
         _save_partial(all_results, args.output)
 

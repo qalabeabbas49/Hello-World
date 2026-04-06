@@ -12,6 +12,7 @@ Endpoints:
   GET  /health         model, backend, workers, active_workers
   GET  /metrics        request counters
 """
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 pool: BaseWhisperPool | None = None
 
+_stats_lock = asyncio.Lock()
 _stats = {
     "total_requests": 0,
     "successful": 0,
@@ -61,20 +63,23 @@ async def transcribe(
         raise HTTPException(status_code=503, detail="Service not ready")
 
     t0 = time.perf_counter()
-    _stats["total_requests"] += 1
+    async with _stats_lock:
+        _stats["total_requests"] += 1
 
     try:
         audio_bytes = await file.read()
         result = await pool.transcribe(audio_bytes, language=language, beam_size=beam_size)
     except Exception as exc:
-        _stats["failed"] += 1
+        async with _stats_lock:
+            _stats["failed"] += 1
         logger.exception("Transcription error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     latency_ms = (time.perf_counter() - t0) * 1000
-    _stats["successful"] += 1
-    _stats["total_audio_seconds"] += result.get("duration", 0.0)
-    _stats["total_latency_ms"] += latency_ms
+    async with _stats_lock:
+        _stats["successful"] += 1
+        _stats["total_audio_seconds"] += result.get("duration", 0.0)
+        _stats["total_latency_ms"] += latency_ms
 
     return {
         **result,

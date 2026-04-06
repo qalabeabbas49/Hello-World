@@ -45,11 +45,14 @@ async def _send_audio(
     filename: str,
     request_id: str,
     collector: MetricsCollector,
+    audio_duration_s: float | None = None,   # None → use cfg default (synthetic)
 ) -> None:
     rec = RequestRecord(
         request_id=request_id,
         start_ts=time.perf_counter(),
-        audio_duration_s=cfg.AUDIO_DURATION_S,
+        # Use provided duration (real files) or fall back to synthetic default.
+        # Correct duration is required for RTF to be meaningful.
+        audio_duration_s=audio_duration_s if audio_duration_s is not None else cfg.AUDIO_DURATION_S,
     )
     try:
         form = aiohttp.FormData()
@@ -80,13 +83,20 @@ async def _run_pool(
     filename_ext: str,
     test_label: str,
     concurrency: int,
+    durations: list[float] | None = None,   # per-file durations; None → use cfg default
 ) -> dict:
     """
     Run one format+rate combination at a fixed concurrency.
     Cycles through the pool, collecting MIN_SAMPLES data points.
+
+    Args:
+        durations: List of audio durations (seconds) parallel to audio_pool.
+                   Used for real audio files so RTF is calculated correctly.
+                   Pass None for synthetic audio (uses cfg.AUDIO_DURATION_S).
     """
-    collector   = MetricsCollector(test_label)
-    audio_cycle = itertools.cycle(audio_pool)
+    collector      = MetricsCollector(test_label)
+    audio_cycle    = itertools.cycle(audio_pool)
+    duration_cycle = itertools.cycle(durations) if durations else itertools.repeat(None)
 
     connector = aiohttp.TCPConnector(limit=concurrency + 4)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -95,6 +105,7 @@ async def _run_pool(
             await _send_audio(
                 session, next(audio_cycle), content_type,
                 f"warmup_{i}.{filename_ext}", f"w{i}", collector,
+                audio_duration_s=next(duration_cycle),
             )
         collector.reset()
 
@@ -105,6 +116,7 @@ async def _run_pool(
                 _send_audio(
                     session, next(audio_cycle), content_type,
                     f"r{round_i}_req{j}.{filename_ext}", f"r{round_i}_req{j}", collector,
+                    audio_duration_s=next(duration_cycle),
                 )
                 for j in range(concurrency)
             ]
@@ -212,23 +224,31 @@ async def run_real_audio_bench(
             label = f"real_{fmt}_{rate}"
             print(f"\n  [{fmt} @ {rate//1000}kHz]  loading files...")
             try:
-                pool      = pool_loader.get_pool(fmt=fmt, sample_rate=rate,
-                                                  max_files=max_files_per_combo)
-                # Also include files with unknown sample rate (they'll be resampled by service)
-                no_rate   = pool_loader.get_pool(fmt=fmt, sample_rate=None,
-                                                  max_files=max_files_per_combo)
-                pool      = (pool + no_rate)[:max_files_per_combo]
+                with_meta      = pool_loader.get_pool_with_meta(fmt=fmt, sample_rate=rate,
+                                                                  max_files=max_files_per_combo)
+                # Also include files with unknown sample rate (resampled by service)
+                no_rate_meta   = pool_loader.get_pool_with_meta(fmt=fmt, sample_rate=None,
+                                                                  max_files=max_files_per_combo)
+                combined       = (with_meta + no_rate_meta)[:max_files_per_combo]
             except ValueError as e:
                 print(f"    SKIP — {e}")
                 results[fmt][str(rate)] = {"skipped": True, "reason": str(e)}
                 continue
 
+            if not combined:
+                print(f"    SKIP — no files for {fmt} @ {rate}")
+                results[fmt][str(rate)] = {"skipped": True, "reason": "no matching files"}
+                continue
+
+            pool      = [b for b, _ in combined]
+            durations = [af.duration_s for _, af in combined]
+
             ext = "ogg" if fmt == "opus" else fmt
             ct  = _content_type(fmt) if fmt in ("wav", "flac", "opus") else "application/octet-stream"
             print(f"  [{fmt} @ {rate//1000}kHz]  {len(pool)} files")
 
-            # Note actual durations may vary (real files aren't all 47 s)
-            summary = await _run_pool(pool, ct, ext, label, concurrency)
+            # Pass per-file durations so RTF reflects real audio length, not synthetic 47 s
+            summary = await _run_pool(pool, ct, ext, label, concurrency, durations=durations)
             summary["fmt"]    = fmt
             summary["rate"]   = rate
             summary["source"] = "real"

@@ -18,12 +18,14 @@ services:
     build:
       context: ./services/whisper
       args:
+        WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
         WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
         WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
     image: bench-whisper:${WHISPER_MODEL:-large-v2}
     ports:
       - "8001:8001"
     environment:
+      WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
       WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
       WHISPER_WORKERS:      ${WHISPER_WORKERS:-16}
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}

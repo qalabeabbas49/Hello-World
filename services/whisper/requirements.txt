@@ -1,8 +1,18 @@
+# faster-whisper backend (CTranslate2 — no PyTorch dependency)
 faster-whisper==1.1.0
+
+# openai-whisper backend (PyTorch)
+# torch is installed separately in Dockerfile via the PyTorch CUDA wheel index
+openai-whisper==20240930
+
+# Service framework
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
-soundfile==0.12.1
-numpy==1.26.4
 uvloop==0.21.0
 httptools==0.6.1
+
+# Audio I/O (shared by both backends)
+soundfile==0.12.1
+numpy==1.26.4
+scipy==1.13.1

@@ -1,113 +1,149 @@
-# GPU Stress Testing Makefile
-# Targets assume you are in the repo root and have Docker + nvidia-container-toolkit installed.
+# GPU Stress Testing — Medical Ambient Scribing
+# ──────────────────────────────────────────────────────────────────────────────
+# Prerequisites:
+#   - Docker + nvidia-container-toolkit
+#   - Python 3.11+  (`pip install -r requirements.txt`)
+#   - Model weights placed at LLM_MODEL_HOST_PATH (see .env.example)
 #
 # Quick start:
-#   cp .env.example .env          # edit LLM_MODEL_HOST_PATH
-#   make fixtures                 # generate synthetic audio files
-#   make bench-whisper MODEL=large-v2
-#   make bench-llm
-#   make bench-e2e
+#   cp .env.example .env                 # edit LLM_MODEL_HOST_PATH
+#   make fixtures                        # generate synthetic 47 s audio
+#   make bench-compare                   # both backends × all Whisper models
+#   make bench-llm                       # LLM throughput sweep
+#   make bench-e2e                       # end-to-end session sweep
+#   make report                          # re-render report.md from saved results
 
-.PHONY: help fixtures \
+.PHONY: help fixtures check-gpu \
         up-whisper up-llm up-mixed down \
-        bench-whisper bench-llm bench-e2e bench-all \
+        bench-whisper bench-llm bench-e2e bench-compare bench-all \
         report clean
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-MODEL   ?= large-v2
-WORKERS ?= 4
-RESULTS ?= ./results
+# ── Configurable defaults ──────────────────────────────────────────────────────
+MODEL    ?= large-v2
+BACKEND  ?= faster_whisper
+WORKERS  ?= 16
+RESULTS  ?= ./results
+SESSIONS ?=
+CHUNKS   ?=
 
 help:
 	@echo ""
-	@echo "  make fixtures              Generate synthetic 47s WAV files"
+	@echo "  Fixtures & checks"
+	@echo "    make fixtures              Generate 20 × 47s synthetic WAV files"
+	@echo "    make check-gpu             Verify GPU driver, Docker GPU access"
 	@echo ""
-	@echo "  make up-whisper            Start Whisper-only service (MODEL=<size>)"
-	@echo "  make up-llm                Start LLM-only service"
-	@echo "  make up-mixed              Start both services (mixed workload)"
-	@echo "  make down                  Stop all services"
+	@echo "  Service management"
+	@echo "    make up-whisper            Start Whisper-only  (BACKEND=, MODEL=, WORKERS=)"
+	@echo "    make up-llm                Start LLM-only"
+	@echo "    make up-mixed              Start both services (mixed workload)"
+	@echo "    make down                  Stop all compose stacks"
 	@echo ""
-	@echo "  make bench-whisper         Whisper concurrency sweep (service must be up)"
-	@echo "  make bench-llm             LLM concurrency sweep (service must be up)"
-	@echo "  make bench-e2e             E2E session sweep (both services must be up)"
-	@echo "  make bench-all             Full suite: all Whisper models + LLM + E2E"
+	@echo "  Benchmarks (manage their own docker lifecycle by default)"
+	@echo "    make bench-whisper         One backend × one model  (BACKEND=, MODEL=)"
+	@echo "    make bench-llm             LLM concurrency sweep"
+	@echo "    make bench-e2e             E2E session sweep"
+	@echo "    make bench-compare         Both backends × ALL model sizes  [main sweep]"
+	@echo "    make bench-all             bench-compare + bench-llm + bench-e2e"
 	@echo ""
-	@echo "  make report                Re-render report from existing results"
-	@echo "  make clean                 Remove result files"
+	@echo "  Results"
+	@echo "    make report                Re-render report.md from saved JSON results"
+	@echo "    make clean                 Delete result files (keeps fixtures)"
 	@echo ""
-	@echo "  Variables:  MODEL=$(MODEL)  WORKERS=$(WORKERS)  RESULTS=$(RESULTS)"
+	@echo "  Variables:  BACKEND=$(BACKEND)  MODEL=$(MODEL)  WORKERS=$(WORKERS)  RESULTS=$(RESULTS)"
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# ── Fixtures & preflight ───────────────────────────────────────────────────────
 fixtures:
-	@echo "Generating synthetic audio fixtures..."
+	@mkdir -p fixtures/audio
 	python -m generators.audio_gen --count 20 --duration 47 --output ./fixtures/audio
-	@echo "Done."
+
+check-gpu:
+	@bash scripts/setup_gpu_isolation.sh
 
 # ── Service management ────────────────────────────────────────────────────────
 up-whisper:
-	WHISPER_MODEL=$(MODEL) WHISPER_WORKERS=$(WORKERS) \
+	WHISPER_BACKEND=$(BACKEND) WHISPER_MODEL=$(MODEL) WHISPER_WORKERS=$(WORKERS) \
 	  docker compose -f docker-compose.whisper-only.yml up -d --build
-	@echo "Waiting for Whisper service..."
 	@bash scripts/verify_services.sh whisper
 
 up-llm:
 	docker compose -f docker-compose.llm-only.yml up -d --build
-	@echo "Waiting for LLM service..."
 	@bash scripts/verify_services.sh llm
 
 up-mixed:
-	WHISPER_MODEL=$(MODEL) WHISPER_WORKERS=$(WORKERS) \
+	WHISPER_BACKEND=$(BACKEND) WHISPER_MODEL=$(MODEL) WHISPER_WORKERS=$(WORKERS) \
 	  docker compose up -d --build
-	@echo "Waiting for services..."
 	@bash scripts/verify_services.sh all
 
 down:
-	-docker compose -f docker-compose.yml              down 2>/dev/null
-	-docker compose -f docker-compose.whisper-only.yml down 2>/dev/null
-	-docker compose -f docker-compose.llm-only.yml     down 2>/dev/null
+	-docker compose -f docker-compose.yml              down 2>/dev/null || true
+	-docker compose -f docker-compose.whisper-only.yml down 2>/dev/null || true
+	-docker compose -f docker-compose.llm-only.yml     down 2>/dev/null || true
 
 # ── Benchmark targets ─────────────────────────────────────────────────────────
-bench-whisper: up-whisper
-	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all --mode whisper --model $(MODEL) --output $(RESULTS)
+
+# Single backend+model Whisper sweep (brings up service, benchmarks, tears down)
+bench-whisper:
+	$(MAKE) up-whisper BACKEND=$(BACKEND) MODEL=$(MODEL) WORKERS=$(WORKERS)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode whisper --model $(MODEL) --backend $(BACKEND) --output $(RESULTS)
 	$(MAKE) down
 
-bench-llm: up-llm
+# LLM-only sweep
+bench-llm:
+	$(MAKE) up-llm
 	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all --mode llm --output $(RESULTS)
 	$(MAKE) down
 
-bench-e2e: up-mixed
-	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all --mode e2e --output $(RESULTS)
+# E2E mixed workload sweep (both services)
+bench-e2e:
+	$(MAKE) up-mixed BACKEND=$(BACKEND) MODEL=$(MODEL) WORKERS=4
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode e2e \
+	  $(if $(SESSIONS),--sessions $(SESSIONS),) \
+	  $(if $(CHUNKS),--chunks $(CHUNKS),) \
+	  --output $(RESULTS)
 	$(MAKE) down
 
-# Full suite — runs each Whisper model size in turn, then LLM, then E2E
+# ── Main comparison sweep: both backends × all model sizes ─────────────────────
+# run_all --mode compare manages docker compose internally per combination.
+bench-compare:
+	@mkdir -p $(RESULTS)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode compare --workers $(WORKERS) --output $(RESULTS)
+	@echo ""
+	@echo "Comparison complete. Report: $(RESULTS)/report.md"
+
+# Full suite: compare + LLM + E2E
 bench-all:
-	@for model in tiny base small medium large-v2 large-v3; do \
-		echo ""; \
-		echo "###############################################"; \
-		echo "  Whisper model: $$model"; \
-		echo "###############################################"; \
-		$(MAKE) bench-whisper MODEL=$$model RESULTS=$(RESULTS)/whisper_$$model; \
-	done
-	$(MAKE) bench-llm   RESULTS=$(RESULTS)
-	$(MAKE) bench-e2e   RESULTS=$(RESULTS)
+	@mkdir -p $(RESULTS)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
+	  --mode all --workers $(WORKERS) \
+	  $(if $(SESSIONS),--sessions $(SESSIONS),) \
+	  $(if $(CHUNKS),--chunks $(CHUNKS),) \
+	  --output $(RESULTS)
+	@echo ""
+	@echo "Full suite complete. Report: $(RESULTS)/report.md"
 
 # ── Report ────────────────────────────────────────────────────────────────────
 report:
-	python - <<'EOF'
+	@python - <<'EOF'
 import json, sys
 from pathlib import Path
 from metrics.reporter import generate_report
 p = Path("$(RESULTS)/all_results.json")
 if not p.exists():
-    print(f"No results found at {p}. Run bench-all first.")
+    print(f"No results at {p}. Run bench-all or bench-compare first.")
     sys.exit(1)
 results = json.loads(p.read_text())
-generate_report(results, gpu_metrics_path="$(RESULTS)/gpu_metrics.jsonl",
-                output_path="$(RESULTS)/report.md")
+generate_report(
+    results,
+    gpu_metrics_path="$(RESULTS)/gpu_metrics.jsonl",
+    output_path="$(RESULTS)/report.md",
+)
 print("Report written to $(RESULTS)/report.md")
 EOF
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 clean:
-	rm -rf $(RESULTS)/*.json $(RESULTS)/*.jsonl $(RESULTS)/*.md
-	@echo "Results cleared."
+	@rm -f $(RESULTS)/*.json $(RESULTS)/*.jsonl $(RESULTS)/*.md
+	@echo "Results cleared (fixtures preserved)."

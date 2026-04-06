@@ -1,32 +1,31 @@
 """
-Whisper transcription service.
+Whisper transcription service — dual-backend (faster-whisper / openai-whisper).
+
+Env vars:
+  WHISPER_BACKEND      faster_whisper (default) | openai_whisper
+  WHISPER_MODEL        Model size (see batch_manager.py for valid names per backend)
+  WHISPER_WORKERS      Concurrent model instances (default 4)
+  WHISPER_COMPUTE_TYPE CTranslate2 precision for faster_whisper (float16 default)
 
 Endpoints:
-  POST /transcribe   multipart/form-data, field "file" = audio bytes
-  GET  /health       returns model name, worker count, active workers
-  GET  /metrics      returns request counters for monitoring
-
-Usage (env vars):
-  WHISPER_MODEL        tiny | base | small | medium | large-v2 | large-v3
-  WHISPER_WORKERS      number of concurrent model instances (default 4)
-  WHISPER_COMPUTE_TYPE float16 | int8_float16 | int8
+  POST /transcribe     multipart/form-data, field "file" = audio bytes
+  GET  /health         model, backend, workers, active_workers
+  GET  /metrics        request counters
 """
 import logging
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse
 
 import config
-from batch_manager import WhisperPool
+from batch_manager import BaseWhisperPool, create_pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-pool: WhisperPool | None = None
+pool: BaseWhisperPool | None = None
 
-# Simple in-process counters (good enough for benchmarking)
 _stats = {
     "total_requests": 0,
     "successful": 0,
@@ -39,14 +38,14 @@ _stats = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
-    pool = WhisperPool(
-        config.MODEL_SIZE,
-        config.NUM_WORKERS,
-        config.DEVICE,
-        config.COMPUTE_TYPE,
+    pool = create_pool(
+        backend=config.WHISPER_BACKEND,
+        model_size=config.MODEL_SIZE,
+        n_workers=config.NUM_WORKERS,
+        device=config.DEVICE,
+        compute_type=config.COMPUTE_TYPE,
     )
     yield
-    # Cleanup — executor shuts down on GC, nothing explicit needed
 
 
 app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
@@ -55,7 +54,7 @@ app = FastAPI(title="Whisper Transcription Service", lifespan=lifespan)
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
-    language: str = Query(default="en", description="BCP-47 language code"),
+    language: str = Query(default="en"),
     beam_size: int = Query(default=5, ge=1, le=10),
 ):
     if pool is None:
@@ -79,9 +78,10 @@ async def transcribe(
 
     return {
         **result,
-        "latency_ms": round(latency_ms, 2),
-        "model": config.MODEL_SIZE,
-        "workers": config.NUM_WORKERS,
+        "latency_ms":     round(latency_ms, 2),
+        "model":          config.MODEL_SIZE,
+        "backend":        config.WHISPER_BACKEND,
+        "workers":        config.NUM_WORKERS,
         "active_workers": pool.active_workers,
     }
 
@@ -89,12 +89,13 @@ async def transcribe(
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
-        "model": config.MODEL_SIZE,
-        "workers": config.NUM_WORKERS,
+        "status":         "ok",
+        "model":          config.MODEL_SIZE,
+        "backend":        config.WHISPER_BACKEND,
+        "workers":        config.NUM_WORKERS,
         "active_workers": pool.active_workers if pool else 0,
-        "compute_type": config.COMPUTE_TYPE,
-        "device": config.DEVICE,
+        "compute_type":   config.COMPUTE_TYPE,
+        "device":         config.DEVICE,
     }
 
 

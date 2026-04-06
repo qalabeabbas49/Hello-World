@@ -151,10 +151,15 @@ real_audio/
 
 **Flat layout** also works — format inferred from extension, sample rate probed via soundfile/ffprobe.
 
-Supported: WAV, FLAC, Opus (.opus / .ogg), MP3, M4A, WebM.
+Supported input formats: WAV, FLAC, Opus (.opus / .ogg), MP3, M4A, WebM.
+
+**Automatic chunking** — recordings of any length are automatically decoded to PCM and split into 47-second WAV chunks before being sent to Whisper. This exactly replicates the production streaming pipeline. The last chunk of each file is discarded if it is shorter than 5 seconds. No pre-processing is needed.
 
 ```bash
 make bench-real-audio REAL_AUDIO_DIR=/path/to/your/audio
+
+# Custom chunk size (seconds) — default is 47
+make bench-real-audio REAL_AUDIO_DIR=/path/to/your/audio CHUNK_DURATION=30
 ```
 
 ---

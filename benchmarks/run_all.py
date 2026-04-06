@@ -183,6 +183,8 @@ async def main() -> None:
         help="Comma-separated formats for format bench (default: wav,flac,opus)")
     parser.add_argument("--audio-rates", default=None,
         help="Comma-separated sample rates for format bench (default: 16000,48000)")
+    parser.add_argument("--chunk-duration", type=float, default=None,
+        help=f"Chunk duration in seconds for real audio (default {cfg.AUDIO_DURATION_S:.0f}s)")
     parser.add_argument("--output",  default=cfg.RESULTS_DIR,  help="Results output directory")
     args = parser.parse_args()
 
@@ -258,6 +260,7 @@ async def main() -> None:
                     real_audio_dir=real_dir,
                     formats=fmts, sample_rates=rates,
                     concurrency=cfg.FORMAT_BENCH_CONCURRENCY,
+                    chunk_duration_s=args.chunk_duration,
                 )
                 all_results["format"]["real"] = real
             else:

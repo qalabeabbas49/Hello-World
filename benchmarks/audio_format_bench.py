@@ -190,16 +190,26 @@ async def run_real_audio_bench(
     sample_rates: list[int] | None = None,
     concurrency: int = 10,
     max_files_per_combo: int = 20,
+    chunk_duration_s: float | None = None,
 ) -> dict:
     """
-    Benchmark using real audio files from a directory.
-    Groups files by format + sample rate, runs each group.
+    Benchmark using real audio files split into production-sized chunks.
+
+    Each source file is decoded to PCM and split into fixed-length WAV chunks
+    (default: cfg.AUDIO_DURATION_S = 47 s) before being sent to Whisper.
+    This exactly replicates the production streaming pipeline where the client
+    segments continuous audio every 47 seconds.
+
+    Files are grouped by original format + sample rate so results remain
+    comparable across recording types. Within each group all derived chunks
+    are sent as standard WAV at the source sample rate.
 
     Returns:
         Nested dict:  results[format][sample_rate] = summary
     """
     from generators.real_audio import RealAudioPool
-    from generators.audio_gen import _content_type
+
+    chunk_s = chunk_duration_s if chunk_duration_s is not None else cfg.AUDIO_DURATION_S
 
     pool_loader = RealAudioPool.from_directory(real_audio_dir, probe=True)
     pool_loader.print_summary()
@@ -207,13 +217,12 @@ async def run_real_audio_bench(
     if formats is None:
         formats = list(pool_loader.summary().keys())
     if sample_rates is None:
-        # Collect all known rates from pool
         all_rates: set[int] = set()
         for info in pool_loader.summary().values():
             all_rates.update(info.get("sample_rates", []))
         sample_rates = sorted(all_rates) or cfg.AUDIO_SAMPLE_RATES
 
-    print(f"\n=== Real Audio Format Benchmark  c={concurrency} ===")
+    print(f"\n=== Real Audio Benchmark  chunk={chunk_s:.0f}s  c={concurrency} ===")
     print(f"Formats: {formats}   Rates: {sample_rates}")
 
     results: dict[str, dict] = {}
@@ -222,43 +231,45 @@ async def run_real_audio_bench(
         results[fmt] = {}
         for rate in sample_rates:
             label = f"real_{fmt}_{rate}"
-            print(f"\n  [{fmt} @ {rate//1000}kHz]  loading files...")
+            print(f"\n  [{fmt} @ {rate//1000}kHz]  loading + chunking files...")
             try:
-                with_meta      = pool_loader.get_pool_with_meta(fmt=fmt, sample_rate=rate,
-                                                                  max_files=max_files_per_combo)
-                # Also include files with unknown sample rate (resampled by service)
-                no_rate_meta   = pool_loader.get_pool_with_meta(fmt=fmt, sample_rate=None,
-                                                                  max_files=max_files_per_combo)
-                combined       = (with_meta + no_rate_meta)[:max_files_per_combo]
+                chunks = pool_loader.get_chunks(
+                    fmt=fmt,
+                    sample_rate=rate,
+                    max_files=max_files_per_combo,
+                    chunk_duration_s=chunk_s,
+                )
             except ValueError as e:
                 print(f"    SKIP — {e}")
                 results[fmt][str(rate)] = {"skipped": True, "reason": str(e)}
                 continue
 
-            if not combined:
-                print(f"    SKIP — no files for {fmt} @ {rate}")
-                results[fmt][str(rate)] = {"skipped": True, "reason": "no matching files"}
-                continue
+            pool      = [c.data for c in chunks]
+            durations = [c.duration_s for c in chunks]
+            n_src     = len({c.source_path for c in chunks})
 
-            pool      = [b for b, _ in combined]
-            durations = [af.duration_s for _, af in combined]
+            print(
+                f"  [{fmt} @ {rate//1000}kHz]  "
+                f"{n_src} source files → {len(pool)} × {chunk_s:.0f}s WAV chunks"
+            )
 
-            ext = "ogg" if fmt == "opus" else fmt
-            ct  = _content_type(fmt) if fmt in ("wav", "flac", "opus") else "application/octet-stream"
-            print(f"  [{fmt} @ {rate//1000}kHz]  {len(pool)} files")
-
-            # Pass per-file durations so RTF reflects real audio length, not synthetic 47 s
-            summary = await _run_pool(pool, ct, ext, label, concurrency, durations=durations)
-            summary["fmt"]    = fmt
-            summary["rate"]   = rate
-            summary["source"] = "real"
-            summary["n_files"] = len(pool)
+            # WAV chunks at source sample rate — content_type is always audio/wav
+            summary = await _run_pool(
+                pool, "audio/wav", "wav", label, concurrency, durations=durations,
+            )
+            summary["fmt"]          = fmt
+            summary["rate"]         = rate
+            summary["source"]       = "real"
+            summary["n_source_files"] = n_src
+            summary["n_chunks"]     = len(pool)
+            summary["chunk_s"]      = chunk_s
             results[fmt][str(rate)] = summary
 
             lm = summary.get("latency_ms", {})
             print(
                 f"    p50={lm.get('p50', 0):.0f}ms  p95={lm.get('p95', 0):.0f}ms  "
                 f"rps={summary.get('throughput_rps', 0):.2f}  "
+                f"RTF={summary.get('audio_realtime_factor', 0):.1f}x  "
                 f"err={summary.get('error_rate_pct', 0):.1f}%"
             )
 
@@ -282,6 +293,8 @@ async def main() -> None:
         help="Concurrent requests per format/rate combo (default 10)")
     parser.add_argument("--max-files", type=int, default=20,
         help="Max real audio files per format+rate combo (default 20)")
+    parser.add_argument("--chunk-duration", type=float, default=None,
+        help=f"Chunk duration in seconds for real audio (default {cfg.AUDIO_DURATION_S:.0f}s)")
     parser.add_argument("--output",   default=cfg.RESULTS_DIR,
         help="Results output directory")
     args = parser.parse_args()
@@ -306,6 +319,7 @@ async def main() -> None:
             formats=fmts, sample_rates=rates,
             concurrency=args.concurrency,
             max_files_per_combo=args.max_files,
+            chunk_duration_s=args.chunk_duration,
         )
         all_results["real"] = real
 

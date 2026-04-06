@@ -28,6 +28,7 @@ CHUNKS         ?=
 FORMATS        ?= wav,flac,opus
 RATES          ?= 16000,48000
 REAL_AUDIO_DIR ?= ./fixtures/real_audio
+CHUNK_DURATION ?= 47
 
 help:
 	@echo ""
@@ -57,7 +58,7 @@ help:
 	@echo "  Key variables:"
 	@echo "    BACKEND=$(BACKEND)  MODEL=$(MODEL)  WORKERS=$(WORKERS)"
 	@echo "    FORMATS=$(FORMATS)  RATES=$(RATES)"
-	@echo "    REAL_AUDIO_DIR=$(REAL_AUDIO_DIR)  RESULTS=$(RESULTS)"
+	@echo "    REAL_AUDIO_DIR=$(REAL_AUDIO_DIR)  CHUNK_DURATION=$(CHUNK_DURATION)s  RESULTS=$(RESULTS)"
 
 # ── Fixtures & preflight ───────────────────────────────────────────────────────
 # Generates subdirs:  fixtures/audio/wav_16000/  wav_48000/  flac_16000/  …
@@ -133,13 +134,14 @@ bench-formats:
 	  --output $(RESULTS)
 	$(MAKE) down
 
-# Same sweep with real audio files (service must be running or will be started by up-whisper)
+# Same sweep with real audio files — auto-splits into CHUNK_DURATION-second WAV chunks
 bench-real-audio:
 	$(MAKE) up-whisper BACKEND=$(BACKEND) MODEL=$(MODEL) WORKERS=$(WORKERS)
 	RESULTS_DIR=$(RESULTS) python -m benchmarks.run_all \
 	  --mode format \
 	  --audio-formats $(FORMATS) --audio-rates $(RATES) \
 	  --real-audio-dir $(REAL_AUDIO_DIR) \
+	  --chunk-duration $(CHUNK_DURATION) \
 	  --output $(RESULTS)
 	$(MAKE) down
 
@@ -152,6 +154,7 @@ bench-all:
 	  $(if $(SESSIONS),--sessions $(SESSIONS),) \
 	  $(if $(CHUNKS),--chunks $(CHUNKS),) \
 	  $(if $(wildcard $(REAL_AUDIO_DIR)),--real-audio-dir $(REAL_AUDIO_DIR),) \
+	  --chunk-duration $(CHUNK_DURATION) \
 	  --output $(RESULTS)
 	@echo ""
 	@echo "Full suite complete. Report: $(RESULTS)/report.md"

@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+# ffmpeg is needed for Opus audio generation + decoding
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy benchmark source (services/ not needed — this is the client only)
+COPY benchmarks/ ./benchmarks/
+COPY generators/  ./generators/
+COPY metrics/     ./metrics/
+COPY fixtures/    ./fixtures/
+
+# Results dir (overridden by volume mount at runtime)
+RUN mkdir -p /app/results
+
+ENV PYTHONUNBUFFERED=1

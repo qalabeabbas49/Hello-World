@@ -1,0 +1,86 @@
+version: "3.9"
+
+# Mixed / production-like setup: both Whisper and LLM share the H200.
+# LLM_GPU_UTIL=0.45 claims ~63 GB for vLLM; ~78 GB remains for Whisper workers.
+# Adjust WHISPER_WORKERS and LLM_GPU_UTIL to explore different VRAM splits.
+
+x-gpu: &gpu
+  driver: nvidia
+  capabilities: [gpu]
+  device_ids: ["0"]   # single H200; change to ["0","1"] for multi-GPU
+
+services:
+  whisper:
+    build:
+      context: ./services/whisper
+      args:
+        WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
+        WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
+        WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+    image: bench-whisper:${WHISPER_MODEL:-large-v2}
+    ports:
+      - "8001:8001"
+    environment:
+      WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
+      WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
+      WHISPER_WORKERS:      ${WHISPER_WORKERS:-4}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      WHISPER_DEVICE:       cuda
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
+    volumes:
+      - whisper_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+    restart: unless-stopped
+
+  llm:
+    build:
+      context: ./services/llm
+    image: bench-llm
+    ports:
+      - "8002:8002"
+    environment:
+      LLM_MODEL_PATH:    ${LLM_MODEL_PATH:-/models/gpt-oss-20b}
+      LLM_GPU_UTIL:      ${LLM_GPU_UTIL:-0.45}
+      LLM_MAX_MODEL_LEN: ${LLM_MAX_MODEL_LEN:-8192}
+      LLM_MAX_NUM_SEQS:  ${LLM_MAX_NUM_SEQS:-128}
+      LLM_DTYPE:         ${LLM_DTYPE:-float16}
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
+    volumes:
+      - ${LLM_MODEL_HOST_PATH:-./models}:/models
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 120s
+      retries: 8
+    restart: unless-stopped
+
+  gpu_monitor:
+    image: python:3.11-slim
+    command: python /monitor/gpu_monitor.py
+    network_mode: host
+    privileged: true   # needed to exec nvidia-smi from inside the container
+    volumes:
+      - ./metrics:/monitor
+      - ./results:/results
+    environment:
+      POLL_INTERVAL_MS: 500
+      OUTPUT_FILE:      /results/gpu_metrics.jsonl
+    depends_on:
+      - whisper
+      - llm
+    restart: unless-stopped
+
+volumes:
+  whisper_cache:

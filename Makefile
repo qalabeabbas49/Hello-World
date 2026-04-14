@@ -17,7 +17,7 @@
         up-whisper up-llm up-vllm-whisper up-mixed down \
         bench-whisper bench-llm bench-e2e bench-compare bench-formats bench-real-audio bench-all \
         bench-whisper-gpu bench-whisper-opt bench-vllm-gpu \
-        bench-vllm-sla bench-vllm-sweep report-vllm \
+        bench-vllm-sla bench-vllm-sweep bench-vllm-queue bench-vllm-scheduler-sweep report-vllm \
         report report-ai clean
 
 # ── Configurable defaults ──────────────────────────────────────────────────────
@@ -55,6 +55,18 @@ VLLM_STEADY_DURATION_S ?= 90
 VLLM_SLA_P95_MS ?= 12000
 VLLM_CONCURRENCY ?= 8,16,24,32,40,48,64,80,100
 VLLM_SLA_CONCURRENCY ?= 4,8,12,16,20,24,28,32
+VLLM_QUEUE_REDIS_URL ?= redis://localhost:6379/0
+VLLM_QUEUE_STREAM ?= whisper_jobs
+VLLM_QUEUE_GROUP ?= whisper_workers
+VLLM_QUEUE_CONSUMERS ?= 8
+VLLM_QUEUE_INGRESS_RPS ?= 8
+VLLM_QUEUE_DURATION_S ?= 90
+VLLM_WHISPER_MAX_BATCHED_TOKENS ?=
+VLLM_WHISPER_SCHEDULER_DELAY_FACTOR ?=
+VLLM_WHISPER_ENABLE_CHUNKED_PREFILL ?= 0
+VLLM_SWEEP_MAX_NUM_SEQS ?= 128,256,384,512
+VLLM_SWEEP_SCHEDULER_DELAY_FACTORS ?= 0.0,0.1,0.2
+VLLM_SWEEP_CHUNKED_PREFILL ?= 0,1
 WHISPER_GPU_UTIL ?= 0.90
 WHISPER_MAX_WORKERS ?= 128
 # full = sweep 1,2,4,... up to VRAM cap; max_only = single run at cap (faster; default for bench-whisper-gpu).
@@ -87,6 +99,8 @@ help:
 	@echo "  vLLM Whisper (recommended, simplified)"
 	@echo "    make bench-vllm-sweep      Canonical steady-state concurrency sweep"
 	@echo "    make bench-vllm-sla        SLA-focused run (p95 threshold)"
+	@echo "    make bench-vllm-queue      Redis queue benchmark (producer/consumer)"
+	@echo "    make bench-vllm-scheduler-sweep  Sweep scheduler/prefill knobs"
 	@echo "    make report-vllm           Re-render vllm_whisper_report.md"
 	@echo ""
 	@echo "  Fixtures & checks"
@@ -124,6 +138,10 @@ help:
 	@echo "    VLLM_BEAM_SIZE=$(VLLM_BEAM_SIZE)  VLLM_INPUT_MODE=$(VLLM_INPUT_MODE)"
 	@echo "    VLLM_LOAD_MODE=$(VLLM_LOAD_MODE)  VLLM_STEADY_DURATION_S=$(VLLM_STEADY_DURATION_S)"
 	@echo "    VLLM_SLA_P95_MS=$(VLLM_SLA_P95_MS)"
+	@echo "    VLLM_QUEUE_REDIS_URL=$(VLLM_QUEUE_REDIS_URL)  VLLM_QUEUE_CONSUMERS=$(VLLM_QUEUE_CONSUMERS)"
+	@echo "    VLLM_QUEUE_INGRESS_RPS=$(VLLM_QUEUE_INGRESS_RPS)  VLLM_QUEUE_DURATION_S=$(VLLM_QUEUE_DURATION_S)"
+	@echo "    VLLM_WHISPER_MAX_BATCHED_TOKENS=$(VLLM_WHISPER_MAX_BATCHED_TOKENS)  VLLM_WHISPER_SCHEDULER_DELAY_FACTOR=$(VLLM_WHISPER_SCHEDULER_DELAY_FACTOR)"
+	@echo "    VLLM_WHISPER_ENABLE_CHUNKED_PREFILL=$(VLLM_WHISPER_ENABLE_CHUNKED_PREFILL)"
 	@echo "    BACKEND=$(BACKEND)  MODEL=$(MODEL)  WORKERS=$(WORKERS)"
 	@echo "    FORMATS=$(FORMATS)  RATES=$(RATES)"
 	@echo "    REAL_AUDIO_DIR=$(REAL_AUDIO_DIR)  CHUNK_DURATION=$(CHUNK_DURATION)s  RESULTS=$(RESULTS)"
@@ -167,6 +185,9 @@ up-vllm-whisper:
 	  VLLM_WHISPER_CACHE_HOST_PATH=$(VLLM_WHISPER_CACHE_HOST_PATH) \
 	  VLLM_WHISPER_GPU_UTIL=$(VLLM_WHISPER_GPU_UTIL) \
 	  VLLM_WHISPER_MAX_NUM_SEQS=$(VLLM_WHISPER_MAX_NUM_SEQS) \
+	  VLLM_WHISPER_MAX_NUM_BATCHED_TOKENS=$(VLLM_WHISPER_MAX_BATCHED_TOKENS) \
+	  VLLM_WHISPER_SCHEDULER_DELAY_FACTOR=$(VLLM_WHISPER_SCHEDULER_DELAY_FACTOR) \
+	  VLLM_WHISPER_ENABLE_CHUNKED_PREFILL=$(VLLM_WHISPER_ENABLE_CHUNKED_PREFILL) \
 	  VLLM_WHISPER_MAX_MODEL_LEN=$(VLLM_WHISPER_MAX_MODEL_LEN) \
 	  docker compose -f docker-compose.vllm-whisper-only.yml up -d --build
 	@MAX_RETRIES=60 bash scripts/verify_services.sh vllm-whisper
@@ -216,6 +237,39 @@ bench-vllm-sla:
 	  --whisper-projection-headroom $(WHISPER_PROJECTION_HEADROOM) \
 	  --target-tiers $(TARGET_TIERS) \
 	  --output $(RESULTS)
+
+bench-vllm-queue:
+	@mkdir -p $(RESULTS)
+	$(MAKE) up-vllm-whisper VLLM_WHISPER_MODEL=$(VLLM_WHISPER_MODEL)
+	RESULTS_DIR=$(RESULTS) python -m benchmarks.queue_bench \
+	  --redis-url $(VLLM_QUEUE_REDIS_URL) \
+	  --stream $(VLLM_QUEUE_STREAM) \
+	  --group $(VLLM_QUEUE_GROUP) \
+	  --consumers $(VLLM_QUEUE_CONSUMERS) \
+	  --ingress-rps $(VLLM_QUEUE_INGRESS_RPS) \
+	  --duration-s $(VLLM_QUEUE_DURATION_S) \
+	  --model $(VLLM_WHISPER_MODEL) \
+	  --whisper-base-url http://localhost:8003 \
+	  --beam-size $(VLLM_BEAM_SIZE) \
+	  --input-mode $(VLLM_INPUT_MODE) \
+	  --reset-stream \
+	  --output $(RESULTS)/queue_bench
+
+bench-vllm-scheduler-sweep:
+	@mkdir -p $(RESULTS)
+	python -m benchmarks.vllm_scheduler_sweep \
+	  --results-root $(RESULTS) \
+	  --model $(VLLM_WHISPER_MODEL) \
+	  --concurrency $(VLLM_SLA_CONCURRENCY) \
+	  --beam-size $(VLLM_BEAM_SIZE) \
+	  --input-mode $(VLLM_INPUT_MODE) \
+	  --load-mode $(VLLM_LOAD_MODE) \
+	  --steady-duration-s $(VLLM_STEADY_DURATION_S) \
+	  --max-p95-ms $(VLLM_SLA_P95_MS) \
+	  --max-num-seqs $(VLLM_SWEEP_MAX_NUM_SEQS) \
+	  --scheduler-delay-factors $(VLLM_SWEEP_SCHEDULER_DELAY_FACTORS) \
+	  --chunked-prefill $(VLLM_SWEEP_CHUNKED_PREFILL) \
+	  --max-num-batched-tokens "$(VLLM_WHISPER_MAX_BATCHED_TOKENS)"
 
 # Single backend+model Whisper sweep (brings up service, benchmarks, tears down)
 bench-whisper:

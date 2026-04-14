@@ -1,13 +1,14 @@
 #!/bin/bash
 # Wait for services to become healthy before starting benchmarks.
-# Usage: bash scripts/verify_services.sh whisper|llm|all
+# Usage: bash scripts/verify_services.sh whisper|llm|vllm-whisper|all
 set -euo pipefail
 
 MODE="${1:-all}"
 WHISPER_URL="${WHISPER_URL:-http://localhost:8001}"
 LLM_URL="${LLM_URL:-http://localhost:8002}"
-MAX_RETRIES=24    # 24 × 5s = 120s max wait
-SLEEP_S=5
+VLLM_WHISPER_BASE_URL="${VLLM_WHISPER_BASE_URL:-http://localhost:8003}"
+MAX_RETRIES="${MAX_RETRIES:-24}"    # default: 24 × 5s = 120s max wait
+SLEEP_S="${SLEEP_S:-5}"
 
 wait_for() {
   local name="$1"
@@ -28,12 +29,15 @@ wait_for() {
 case "$MODE" in
   whisper) wait_for "Whisper" "$WHISPER_URL" ;;
   llm)     wait_for "LLM"     "$LLM_URL"     ;;
+  vllm-whisper|vllm_whisper)
+    wait_for "vLLM Whisper" "$VLLM_WHISPER_BASE_URL"
+    ;;
   all)
     wait_for "Whisper" "$WHISPER_URL"
     wait_for "LLM"     "$LLM_URL"
     ;;
   *)
-    echo "Usage: $0 whisper|llm|all" >&2
+    echo "Usage: $0 whisper|llm|vllm-whisper|all" >&2
     exit 1
     ;;
 esac

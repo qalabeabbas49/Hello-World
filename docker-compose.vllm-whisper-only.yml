@@ -1,0 +1,64 @@
+# vLLM Whisper-only isolation test.
+# This runs Whisper through vLLM's OpenAI-compatible audio transcription API.
+#
+# Usage:
+#   VLLM_WHISPER_MODEL=openai/whisper-large-v3 \
+#     docker compose -f docker-compose.vllm-whisper-only.yml up -d --build
+
+x-gpu: &gpu
+  driver: nvidia
+  capabilities: [gpu]
+  device_ids: ["0"]
+
+services:
+  vllm_whisper:
+    build:
+      context: ./services/vllm_whisper
+      args:
+        VLLM_WHISPER_IMAGE: ${VLLM_WHISPER_IMAGE:-vllm/vllm-openai:latest}
+    image: bench-vllm-whisper
+    ports:
+      - "8003:8003"
+    environment:
+      VLLM_WHISPER_MODEL:             ${VLLM_WHISPER_MODEL:-openai/whisper-large-v3}
+      VLLM_WHISPER_GPU_UTIL:          ${VLLM_WHISPER_GPU_UTIL:-0.95}
+      VLLM_WHISPER_MAX_NUM_SEQS:      ${VLLM_WHISPER_MAX_NUM_SEQS:-2048}
+      VLLM_WHISPER_DTYPE:             ${VLLM_WHISPER_DTYPE:-auto}
+      VLLM_WHISPER_EXTRA_ARGS:        ${VLLM_WHISPER_EXTRA_ARGS:-}
+      VLLM_WHISPER_PORT:              8003
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
+    volumes:
+      - ${VLLM_WHISPER_CACHE_HOST_PATH:-./models}:/models
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8003/health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 180s
+      retries: 12
+    restart: unless-stopped
+
+  gpu_monitor:
+    build:
+      context: ./services/gpu_monitor
+    image: bench-gpu-monitor
+    command: python3 /monitor/gpu_monitor.py
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    network_mode: host
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
+    volumes:
+      - ./metrics:/monitor
+      - ${RESULTS_DIR_HOST:-./results}:/results
+    environment:
+      POLL_INTERVAL_MS: 500
+      OUTPUT_FILE:      /results/gpu_metrics_vllm_whisper_only.jsonl
+      LABEL_FILE:       /results/gpu_label.txt
+    depends_on:
+      - vllm_whisper
+    restart: unless-stopped

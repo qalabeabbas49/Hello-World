@@ -88,7 +88,7 @@ async def poll_forever() -> None:
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     print(f"GPU monitor started → {OUTPUT_FILE}  (interval={POLL_INTERVAL*1000:.0f}ms)")
 
-    with OUTPUT_FILE.open("a", buffering=1) as fh:   # line-buffered
+    with OUTPUT_FILE.open("w", buffering=1) as fh:   # line-buffered, fresh file per monitor run
         while True:
             ts = time.time()
             try:

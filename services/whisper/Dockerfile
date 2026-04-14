@@ -12,7 +12,8 @@ WORKDIR /app
 
 # Install requirements (torch is already in base image; pip won't reinstall it)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade "setuptools<81" wheel && \
+    pip install --no-cache-dir --no-build-isolation -r requirements.txt
 
 COPY . .
 

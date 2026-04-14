@@ -1,30 +1,45 @@
-"""
-Whisper throughput benchmark — supports both faster-whisper and openai-whisper backends.
-
-The running Whisper service is already configured for a specific backend+model via env vars.
-This script hits the HTTP service, so it's backend-agnostic at the client level.
-The `backend` and `model_label` arguments are used purely for result labelling.
-
-Methodology per concurrency level:
-  1. Warmup: WARMUP_REQUESTS sequential requests.
-  2. Test:   asyncio.gather(concurrency tasks) repeated for ceil(MIN_SAMPLES/concurrency) rounds.
-  3. Cooldown: COOLDOWN_S before next level.
-
-Run directly:
-  python -m benchmarks.whisper_bench --model large-v2 --backend faster_whisper
-"""
+"""vLLM Whisper throughput benchmark (OpenAI-compatible transcription API)."""
 import asyncio
 import argparse
+import io
 import itertools
 import json
+import math
 import time
+import wave
 from pathlib import Path
 
 import aiohttp
+import numpy as np
 
 from benchmarks import config as cfg
-from generators.audio_gen import generate_pool
+from generators.audio_gen import generate_pool, generate_pool_pcm_f32le
 from metrics.collector import MetricsCollector, RequestRecord, set_gpu_label, clear_gpu_label
+
+
+def _vllm_transcription_url() -> str:
+    base = cfg.VLLM_WHISPER_URL.rstrip("/")
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+    return f"{base}/audio/transcriptions"
+
+
+def _pcm_f32le_to_wav_bytes(audio_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    """
+    Convert raw float32 mono PCM bytes to WAV bytes in-memory.
+    This keeps decoding client-side while sending a transport format the
+    OpenAI-compatible vLLM transcription endpoint accepts.
+    """
+    pcm = np.frombuffer(audio_bytes, dtype=np.float32)
+    # Clamp to [-1, 1] and quantize to int16 PCM for broad WAV compatibility.
+    pcm_i16 = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_i16.tobytes())
+    return buf.getvalue()
 
 
 async def _single_transcribe(
@@ -32,6 +47,10 @@ async def _single_transcribe(
     audio_bytes: bytes,
     request_id: str,
     collector: MetricsCollector,
+    backend: str,
+    model_label: str,
+    input_mode: str,
+    beam_size: int,
 ) -> None:
     rec = RequestRecord(
         request_id=request_id,
@@ -39,10 +58,18 @@ async def _single_transcribe(
         audio_duration_s=cfg.AUDIO_DURATION_S,
     )
     try:
-        form = aiohttp.FormData()
-        form.add_field("file", audio_bytes, filename="audio.wav", content_type="audio/wav")
         timeout = aiohttp.ClientTimeout(total=cfg.WHISPER_TIMEOUT)
-        async with session.post(f"{cfg.WHISPER_URL}/transcribe", data=form, timeout=timeout) as resp:
+        form = aiohttp.FormData()
+        upload_bytes = audio_bytes
+        if input_mode == "pcm_f32le":
+            upload_bytes = _pcm_f32le_to_wav_bytes(audio_bytes, sample_rate=16000)
+        form.add_field("file", upload_bytes, filename="audio.wav", content_type="audio/wav")
+        form.add_field("model", model_label)
+        form.add_field("language", "en")
+        form.add_field("response_format", "json")
+        form.add_field("temperature", "0.0")
+        url = _vllm_transcription_url()
+        async with session.post(url, data=form, timeout=timeout, params={"beam_size": str(beam_size)}) as resp:
             rec.end_ts     = time.perf_counter()
             rec.latency_ms = (rec.end_ts - rec.start_ts) * 1000
             if resp.status == 200:
@@ -59,12 +86,88 @@ async def _single_transcribe(
     await collector.record(rec)
 
 
+async def _run_concurrency_level_batch(
+    concurrency: int,
+    audio_pool: list[bytes],
+    test_name: str,
+    session: aiohttp.ClientSession,
+    backend: str,
+    model_label: str,
+    input_mode: str,
+    beam_size: int,
+) -> MetricsCollector:
+    audio_cycle = itertools.cycle(audio_pool)
+    collector = MetricsCollector(test_name)
+    n_rounds = max(1, math.ceil(cfg.MIN_SAMPLES / concurrency))
+    for round_i in range(n_rounds):
+        tasks = [
+            _single_transcribe(
+                session,
+                next(audio_cycle),
+                f"r{round_i}_req{j}",
+                collector,
+                backend,
+                model_label,
+                input_mode,
+                beam_size,
+            )
+            for j in range(concurrency)
+        ]
+        await asyncio.gather(*tasks)
+    return collector
+
+
+async def _run_concurrency_level_steady(
+    concurrency: int,
+    audio_pool: list[bytes],
+    test_name: str,
+    session: aiohttp.ClientSession,
+    backend: str,
+    model_label: str,
+    input_mode: str,
+    beam_size: int,
+) -> MetricsCollector:
+    """
+    Maintain `concurrency` concurrent request pipelines until duration elapses
+    (each pipeline issues the next request as soon as the previous completes).
+    """
+    audio_cycle = itertools.cycle(audio_pool)
+    collector = MetricsCollector(test_name)
+    duration = max(1.0, cfg.WHISPER_STEADY_STATE_DURATION_S)
+
+    async def worker(wid: int) -> None:
+        n = 0
+        while True:
+            if time.perf_counter() >= deadline:
+                break
+            await _single_transcribe(
+                session,
+                next(audio_cycle),
+                f"w{wid}_r{n}",
+                collector,
+                backend,
+                model_label,
+                input_mode,
+                beam_size,
+            )
+            n += 1
+
+    deadline = time.perf_counter() + duration
+    await asyncio.gather(*[worker(j) for j in range(concurrency)])
+    return collector
+
+
 async def _run_concurrency_level(
     concurrency: int,
     audio_pool: list[bytes],
     label: str,          # e.g. "fw_large-v2" or "ow_turbo"
+    backend: str,
+    model_label: str,
+    input_mode: str,
+    beam_size: int,
 ) -> dict:
-    test_name   = f"whisper_{label}_c{concurrency}"
+    load_mode = cfg.WHISPER_LOAD_MODE if cfg.WHISPER_LOAD_MODE in ("batch", "steady") else "batch"
+    test_name = f"whisper_{label}_c{concurrency}"
     audio_cycle = itertools.cycle(audio_pool)
 
     connector = aiohttp.TCPConnector(limit=concurrency + 10)
@@ -72,29 +175,54 @@ async def _run_concurrency_level(
         # Warmup
         warmup_col = MetricsCollector(f"{test_name}_warmup")
         for i in range(cfg.WARMUP_REQUESTS):
-            await _single_transcribe(session, next(audio_cycle), f"w{i}", warmup_col)
+            await _single_transcribe(
+                session, next(audio_cycle), f"w{i}", warmup_col, backend, model_label, input_mode, beam_size
+            )
         w = warmup_col.summarize()
         print(f"    warmup  avg={w.get('latency_ms', {}).get('mean', 0):.0f}ms")
 
-        # Actual test
-        collector = MetricsCollector(test_name)
-        n_rounds  = max(1, cfg.MIN_SAMPLES // concurrency)
-        for round_i in range(n_rounds):
-            tasks = [
-                _single_transcribe(session, next(audio_cycle), f"r{round_i}_req{j}", collector)
-                for j in range(concurrency)
-            ]
-            await asyncio.gather(*tasks)
+        if load_mode == "steady":
+            print(
+                f"    load=steady  duration={cfg.WHISPER_STEADY_STATE_DURATION_S:.0f}s  "
+                f"pipelines={concurrency}"
+            )
+            collector = await _run_concurrency_level_steady(
+                concurrency,
+                audio_pool,
+                test_name,
+                session,
+                backend,
+                model_label,
+                input_mode,
+                beam_size,
+            )
+        else:
+            collector = await _run_concurrency_level_batch(
+                concurrency,
+                audio_pool,
+                test_name,
+                session,
+                backend,
+                model_label,
+                input_mode,
+                beam_size,
+            )
 
     summary = collector.summarize()
     summary["concurrency"] = concurrency
+    summary["load_mode"] = load_mode
+    if load_mode == "steady":
+        summary["steady_state_duration_s"] = cfg.WHISPER_STEADY_STATE_DURATION_S
     return summary
 
 
 async def run_whisper_bench(
     model_label: str = "unknown",
-    backend: str = "faster_whisper",
+    backend: str = "vllm_whisper",
     whisper_url: str | None = None,
+    label_prefix: str | None = None,
+    input_mode: str = "file",
+    beam_size: int = 5,
 ) -> dict:
     """
     Run the full Whisper concurrency sweep.
@@ -104,25 +232,48 @@ async def run_whisper_bench(
         Each summary includes a "backend" and "model" field for the matrix reporter.
     """
     if whisper_url:
-        cfg.WHISPER_URL = whisper_url
+        cfg.VLLM_WHISPER_URL = whisper_url.rstrip("/")
 
-    # Short prefix for result keys: "fw" or "ow"
-    prefix = "fw" if "faster" in backend else "ow"
-    label  = f"{prefix}_{model_label}"
+    prefix = "vw"
+    safe_model = model_label.replace("/", "_").replace(":", "_")
+    label  = label_prefix or f"{prefix}_{safe_model}"
+    target_url = cfg.VLLM_WHISPER_URL
 
-    print(f"\n=== Whisper Bench  backend={backend}  model={model_label}  url={cfg.WHISPER_URL} ===")
-    print(f"Generating {cfg.AUDIO_POOL_SIZE} × {cfg.AUDIO_DURATION_S}s audio files...")
-    audio_pool = generate_pool(cfg.AUDIO_POOL_SIZE, cfg.AUDIO_DURATION_S)
-    print(f"  {len(audio_pool)} files ready  ({len(audio_pool[0]) // 1024} KB each)")
+    effective_input_mode = input_mode
+    load_mode_label = cfg.WHISPER_LOAD_MODE if cfg.WHISPER_LOAD_MODE in ("batch", "steady") else "batch"
+    print(
+        f"\n=== Whisper Bench  backend={backend}  model={model_label}  url={target_url}  "
+        f"input_mode={effective_input_mode}  beam_size={beam_size}  load_mode={load_mode_label} ==="
+    )
+    if load_mode_label == "steady":
+        print(f"  steady_state_duration_s={cfg.WHISPER_STEADY_STATE_DURATION_S:.0f}")
+    if effective_input_mode == "pcm_f32le":
+        print(f"Generating {cfg.AUDIO_POOL_SIZE} × {cfg.AUDIO_DURATION_S}s pre-decoded PCM payloads...")
+        audio_pool = generate_pool_pcm_f32le(cfg.AUDIO_POOL_SIZE, cfg.AUDIO_DURATION_S)
+        print(f"  {len(audio_pool)} payloads ready  ({len(audio_pool[0]) // 1024} KB each)")
+    else:
+        print(f"Generating {cfg.AUDIO_POOL_SIZE} × {cfg.AUDIO_DURATION_S}s audio files...")
+        audio_pool = generate_pool(cfg.AUDIO_POOL_SIZE, cfg.AUDIO_DURATION_S)
+        print(f"  {len(audio_pool)} files ready  ({len(audio_pool[0]) // 1024} KB each)")
 
     results: dict[str, dict] = {}
     for concurrency in cfg.WHISPER_CONCURRENCY:
         print(f"\n  concurrency={concurrency}")
         set_gpu_label(f"{label}_c{concurrency}")
-        summary = await _run_concurrency_level(concurrency, audio_pool, label)
+        summary = await _run_concurrency_level(
+            concurrency,
+            audio_pool,
+            label,
+            backend,
+            model_label,
+            effective_input_mode,
+            beam_size,
+        )
         # Stamp backend + model onto every result for the reporter
         summary["backend"] = backend
         summary["model"]   = model_label
+        summary["input_mode"] = effective_input_mode
+        summary["beam_size"] = beam_size
         results[str(concurrency)] = summary
 
         lm  = summary.get("latency_ms", {})
@@ -152,14 +303,31 @@ def _save(results: dict, label: str) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",   default="large-v2",      help="Whisper model label")
-    parser.add_argument("--backend", default="faster_whisper", help="faster_whisper | openai_whisper")
-    parser.add_argument("--url",     default=None,             help="Override WHISPER_URL")
+    parser.add_argument("--model", default=cfg.VLLM_WHISPER_MODEL, help="vLLM Whisper model label")
+    parser.add_argument("--backend", default="vllm_whisper", help="Only vllm_whisper is supported")
+    parser.add_argument("--url", default=None, help="Override VLLM_WHISPER_URL")
+    parser.add_argument("--input-mode", default="file", choices=["file", "pcm_f32le"], help="Benchmark input mode")
+    parser.add_argument("--beam-size", type=int, default=5, help="Whisper beam size")
+    parser.add_argument("--load-mode", choices=["batch", "steady"], default=None,
+        help="Override WHISPER_LOAD_MODE (batch or steady in-flight pipelines)")
+    parser.add_argument("--steady-duration-s", type=float, default=None,
+        help="Override WHISPER_STEADY_STATE_DURATION_S for steady mode")
     args = parser.parse_args()
 
-    prefix  = "fw" if "faster" in args.backend else "ow"
-    label   = f"{prefix}_{args.model}"
-    results = await run_whisper_bench(model_label=args.model, backend=args.backend, whisper_url=args.url)
+    if args.load_mode:
+        cfg.WHISPER_LOAD_MODE = args.load_mode
+    if args.steady_duration_s is not None:
+        cfg.WHISPER_STEADY_STATE_DURATION_S = float(args.steady_duration_s)
+
+    prefix = "vw"
+    label = f"{prefix}_{args.model.replace('/', '_').replace(':', '_')}"
+    results = await run_whisper_bench(
+        model_label=args.model,
+        backend=args.backend,
+        whisper_url=args.url,
+        input_mode=args.input_mode,
+        beam_size=args.beam_size,
+    )
     _save(results, label)
 
 

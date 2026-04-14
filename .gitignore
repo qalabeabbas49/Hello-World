@@ -2,6 +2,8 @@
 results/*.json
 results/*.jsonl
 results/*.md
+results/gpu_label.txt
+results/interim/
 
 # Generated fixtures (regenerate with `make fixtures`)
 fixtures/audio/**/*.wav

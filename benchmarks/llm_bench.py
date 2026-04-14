@@ -22,6 +22,7 @@ import asyncio
 import argparse
 import itertools
 import json
+import math
 import time
 from pathlib import Path
 
@@ -29,7 +30,7 @@ import aiohttp
 
 from benchmarks import config as cfg
 from generators.transcript_gen import generate_prompt
-from metrics.collector import MetricsCollector, RequestRecord
+from metrics.collector import MetricsCollector, RequestRecord, clear_gpu_label, set_gpu_label
 
 
 def _make_prompt_pool(size: int) -> list[dict]:
@@ -117,7 +118,7 @@ async def _run_concurrency_level(
             print(f"    TTFT = {ttft_ms:.0f} ms")
 
         collector = MetricsCollector(test_name)
-        n_rounds  = max(1, cfg.MIN_SAMPLES // concurrency)
+        n_rounds  = max(1, math.ceil(cfg.MIN_SAMPLES / concurrency))
 
         for round_i in range(n_rounds):
             tasks = [
@@ -143,6 +144,7 @@ async def run_llm_bench(llm_url: str | None = None) -> dict:
     results: dict[str, dict] = {}
     for concurrency in cfg.LLM_CONCURRENCY:
         print(f"\n  concurrency = {concurrency}")
+        set_gpu_label(f"vllm_c{concurrency}")
         summary = await _run_concurrency_level(concurrency, prompt_pool)
         results[str(concurrency)] = summary
 
@@ -158,6 +160,7 @@ async def run_llm_bench(llm_url: str | None = None) -> dict:
             print(f"  cooling down {cfg.COOLDOWN_S}s...")
             await asyncio.sleep(cfg.COOLDOWN_S)
 
+    clear_gpu_label()
     return results
 
 

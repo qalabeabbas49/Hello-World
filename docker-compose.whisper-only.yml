@@ -1,11 +1,9 @@
-version: "3.9"
-
 # Whisper-only isolation test.
 # The LLM service is absent; the full 141 GB H200 VRAM is available to Whisper.
 # Set WHISPER_WORKERS to a high value (e.g. 32) to probe true GPU saturation.
 #
 # Usage:
-#   WHISPER_MODEL=large-v2 WHISPER_WORKERS=16 \
+#   WHISPER_MODEL=large-v3 WHISPER_WORKERS=16 \
 #     docker compose -f docker-compose.whisper-only.yml up -d --build
 
 x-gpu: &gpu
@@ -19,16 +17,17 @@ services:
       context: ./services/whisper
       args:
         WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
-        WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
+        WHISPER_MODEL:        ${WHISPER_MODEL:-large-v3}
         WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
-    image: bench-whisper:${WHISPER_MODEL:-large-v2}
+    image: bench-whisper:${WHISPER_MODEL:-large-v3}
     ports:
       - "8001:8001"
     environment:
       WHISPER_BACKEND:      ${WHISPER_BACKEND:-faster_whisper}
-      WHISPER_MODEL:        ${WHISPER_MODEL:-large-v2}
+      WHISPER_MODEL:        ${WHISPER_MODEL:-large-v3}
       WHISPER_WORKERS:      ${WHISPER_WORKERS:-16}
       WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      WHISPER_OPENAI_FP16:  ${WHISPER_OPENAI_FP16:-1}
       WHISPER_DEVICE:       cuda
     deploy:
       resources:
@@ -45,16 +44,24 @@ services:
     restart: unless-stopped
 
   gpu_monitor:
-    image: python:3.11-slim
-    command: python /monitor/gpu_monitor.py
+    build:
+      context: ./services/gpu_monitor
+    image: bench-gpu-monitor
+    command: python3 /monitor/gpu_monitor.py
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     network_mode: host
     privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
     volumes:
       - ./metrics:/monitor
-      - ./results:/results
+      - ${RESULTS_DIR_HOST:-./results}:/results
     environment:
       POLL_INTERVAL_MS: 500
       OUTPUT_FILE:      /results/gpu_metrics_whisper_only.jsonl
+      LABEL_FILE:       /results/gpu_label.txt
     depends_on:
       - whisper
     restart: unless-stopped

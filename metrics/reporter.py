@@ -14,10 +14,11 @@ Capacity formula:
 """
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
-from benchmarks.config import WHISPER_MODEL_MAP, WHISPER_COMPARE_CONCURRENCY
+from benchmarks.config import TARGET_CONCURRENCY_TIERS, WHISPER_MODEL_MAP, WHISPER_COMPARE_CONCURRENCY
 
 
 # ── Capacity projections ──────────────────────────────────────────────────────
@@ -62,6 +63,19 @@ def load_gpu_metrics(path: str | Path) -> list[dict]:
     return records
 
 
+def filter_gpu_metrics(records: list[dict], label_prefixes: list[str] | None = None) -> list[dict]:
+    if not label_prefixes:
+        return records
+    prefixes = [prefix for prefix in label_prefixes if prefix]
+    if not prefixes:
+        return records
+    return [
+        record
+        for record in records
+        if any(str(record.get("label", "")).startswith(prefix) for prefix in prefixes)
+    ]
+
+
 def summarize_gpu_metrics(records: list[dict]) -> dict:
     if not records:
         return {}
@@ -72,13 +86,74 @@ def summarize_gpu_metrics(records: list[dict]) -> dict:
     gpu_util = [r["gpu_util_pct"]  for r in valid]
     power    = [r["power_w"]       for r in valid if r.get("power_w",  -1) >= 0]
     temp     = [r["temp_c"]        for r in valid if r.get("temp_c",   -1) >= 0]
+    names    = sorted({str(r.get("gpu_name", "unknown")) for r in valid if r.get("gpu_name")})
+    indices  = sorted({str(r.get("gpu_index", "?")) for r in valid if r.get("gpu_index") is not None})
+    totals   = [r["mem_total_mib"] for r in valid if r.get("mem_total_mib", -1) >= 0]
     return {
+        "gpu_names":    names,
+        "gpu_indices":  indices,
+        "mem_total_mib": max(totals, default=0),
         "mem_used_mib": {"max": max(mem_used),             "mean": round(sum(mem_used) / len(mem_used), 1)},
         "gpu_util_pct": {"max": max(gpu_util),             "mean": round(sum(gpu_util) / len(gpu_util), 1)},
         "power_w":      {"max": max(power, default=0),     "mean": round(sum(power)    / max(len(power),  1), 1)},
         "temp_c":       {"max": max(temp,  default=0),     "mean": round(sum(temp)     / max(len(temp),   1), 1)},
         "samples":      len(valid),
     }
+
+
+def _gpu_label(gpu_summary: dict) -> str:
+    names = gpu_summary.get("gpu_names") or []
+    if not names:
+        return "GPU detected from benchmark host"
+    if len(names) == 1:
+        total_gb = gpu_summary.get("mem_total_mib", 0) / 1024
+        suffix = f" ({total_gb:.1f} GiB VRAM)" if total_gb else ""
+        return f"{names[0]}{suffix}"
+    return ", ".join(names)
+
+
+def _gpu_summary_table(gpu_summary: dict) -> str:
+    if not gpu_summary:
+        return "_GPU metrics not available. Start the matching gpu_monitor sidecar for this benchmark._"
+    rows = [
+        ["GPU(s)", _gpu_label(gpu_summary), ""],
+        ["GPU index", ", ".join(gpu_summary.get("gpu_indices", [])) or "unknown", ""],
+        ["VRAM total (MiB)", f"{gpu_summary.get('mem_total_mib', 0):.0f}", ""],
+        ["VRAM used (MiB)", f"{gpu_summary['mem_used_mib']['max']:.0f}", f"{gpu_summary['mem_used_mib']['mean']:.0f}"],
+        ["GPU utilization (%)", f"{gpu_summary['gpu_util_pct']['max']:.1f}", f"{gpu_summary['gpu_util_pct']['mean']:.1f}"],
+        ["Power draw (W)", f"{gpu_summary['power_w']['max']:.0f}", f"{gpu_summary['power_w']['mean']:.0f}"],
+        ["Temperature (C)", f"{gpu_summary['temp_c']['max']:.0f}", f"{gpu_summary['temp_c']['mean']:.0f}"],
+    ]
+    return _md_table(["Metric", "Peak / Value", "Mean"], rows)
+
+
+def project_rps_capacity(
+    throughput_rps_per_gpu: int | float,
+    target_tiers: list[int] | None = None,
+    headroom_factor: float = 1.0,
+) -> list[dict]:
+    """
+    Fleet projection from measured req/s per GPU.
+
+    headroom_factor: multiply effective capacity by this before dividing (e.g. 0.85
+    to plan conservatively when measured load used batch mode or differs from prod).
+    """
+    if target_tiers is None:
+        target_tiers = TARGET_CONCURRENCY_TIERS
+    raw_cap = max(float(throughput_rps_per_gpu), 0.001)
+    hf = max(float(headroom_factor), 0.001)
+    capacity = raw_cap * hf
+    rows = []
+    for target in target_tiers:
+        gpus_needed = math.ceil(target / capacity)
+        utilization = target / (gpus_needed * capacity) * 100
+        rows.append({
+            "target_rps": target,
+            "throughput_rps_per_gpu": round(capacity, 3),
+            "gpus_needed": gpus_needed,
+            "utilization_pct": round(utilization, 1),
+        })
+    return rows
 
 
 # ── Markdown helpers ──────────────────────────────────────────────────────────
@@ -129,6 +204,209 @@ def _fmt_ms(val) -> str:
         return "—"
 
 
+def _looks_like_concurrency_results(results: dict) -> bool:
+    return any(str(k).isdigit() and isinstance(v, dict) for k, v in results.items())
+
+
+def _safe_slug(value: str) -> str:
+    slug = value.strip().replace("/", "_").replace(":", "_").replace(" ", "_")
+    return "".join(ch for ch in slug if ch.isalnum() or ch in ("-", "_", "."))
+
+
+def _whisper_label_prefix(backend: str, model: str, workers: int | None = None) -> str:
+    prefix = {
+        "faster_whisper": "fw",
+        "openai_whisper": "ow",
+        "vllm_whisper": "vw",
+    }.get(backend, backend[:2])
+    base = f"{prefix}_{_safe_slug(model)}"
+    if workers is None:
+        return base
+    return f"{base}_w{workers}"
+
+
+def _unwrap_selected_results(results: dict) -> tuple[int | None, dict]:
+    if isinstance(results, dict) and isinstance(results.get("selected_results"), dict):
+        selected_workers = results.get("selected_workers")
+        try:
+            selected_workers = int(selected_workers) if selected_workers is not None else None
+        except (TypeError, ValueError):
+            selected_workers = None
+        return selected_workers, results["selected_results"]
+    return None, results
+
+
+def _preferred_compute_results(model_results: dict) -> tuple[str | None, dict]:
+    """Return one compute-type layer for legacy comparison tables."""
+    if _looks_like_concurrency_results(model_results):
+        return None, model_results
+    for compute_type in ("float16", "fp16", "int8_float16", "int8"):
+        results = model_results.get(compute_type)
+        if isinstance(results, dict):
+            _, selected = _unwrap_selected_results(results)
+            return compute_type, selected
+    for compute_type, results in model_results.items():
+        if isinstance(results, dict):
+            _, selected = _unwrap_selected_results(results)
+            return str(compute_type), selected
+    return None, {}
+
+
+def _iter_whisper_result_sets(all_results: dict) -> list[dict]:
+    """Flatten Whisper results across backend/model/compute_type shapes."""
+    rows: list[dict] = []
+    compare = all_results.get("whisper_compare") or {}
+    for backend, models in compare.items():
+        if not isinstance(models, dict):
+            continue
+        for model, model_results in models.items():
+            if not isinstance(model_results, dict) or model_results.get("error"):
+                continue
+            if _looks_like_concurrency_results(model_results):
+                rows.append({
+                    "backend": backend,
+                    "model": model,
+                    "compute_type": None,
+                    "workers": None,
+                    "selected": True,
+                    "label_prefix": _whisper_label_prefix(backend, model),
+                    "results": model_results,
+                })
+                continue
+            for compute_type, results in model_results.items():
+                if isinstance(results, dict) and not results.get("error"):
+                    if isinstance(results.get("workers"), dict):
+                        selected_workers = results.get("selected_workers")
+                        try:
+                            selected_workers = int(selected_workers) if selected_workers is not None else None
+                        except (TypeError, ValueError):
+                            selected_workers = None
+                        for worker, worker_results in results["workers"].items():
+                            if not (str(worker).isdigit() and isinstance(worker_results, dict) and not worker_results.get("error")):
+                                continue
+                            worker_int = int(worker)
+                            rows.append({
+                                "backend": backend,
+                                "model": model,
+                                "compute_type": str(compute_type),
+                                "workers": worker_int,
+                                "selected": worker_int == selected_workers,
+                                "label_prefix": _whisper_label_prefix(backend, model, worker_int),
+                                "results": worker_results,
+                            })
+                        continue
+                    rows.append({
+                        "backend": backend,
+                        "model": model,
+                        "compute_type": str(compute_type),
+                        "workers": None,
+                        "selected": True,
+                        "label_prefix": _whisper_label_prefix(backend, model),
+                        "results": results,
+                    })
+
+    single = all_results.get("whisper") or {}
+    for backend, models in single.items():
+        if not isinstance(models, dict):
+            continue
+        for model, results in models.items():
+            if isinstance(results, dict):
+                rows.append({
+                    "backend": backend,
+                    "model": model,
+                    "compute_type": None,
+                    "workers": None,
+                    "selected": True,
+                    "label_prefix": _whisper_label_prefix(backend, model),
+                    "results": results,
+                })
+    return rows
+
+
+def _iter_concurrency_summaries(results: dict) -> list[tuple[int, dict]]:
+    items: list[tuple[int, dict]] = []
+    for concurrency, summary in results.items():
+        if str(concurrency).isdigit() and isinstance(summary, dict):
+            items.append((int(concurrency), summary))
+    return sorted(items, key=lambda item: item[0])
+
+
+def _stable_summary(results: dict, max_error_pct: float = 1.0) -> tuple[int, dict] | None:
+    stable = [
+        (concurrency, summary)
+        for concurrency, summary in _iter_concurrency_summaries(results)
+        if summary.get("successful", 0) > 0
+        and float(summary.get("error_rate_pct", 100.0)) <= max_error_pct
+        and "latency_ms" in summary
+    ]
+    if not stable:
+        return None
+    return max(stable, key=lambda item: item[0])
+
+
+def _peak_throughput_summary(results: dict, max_error_pct: float | None = None) -> tuple[int, dict] | None:
+    summaries = [
+        (concurrency, summary)
+        for concurrency, summary in _iter_concurrency_summaries(results)
+        if summary.get("successful", 0) > 0
+        and (
+            max_error_pct is None
+            or float(summary.get("error_rate_pct", 100.0)) <= max_error_pct
+        )
+    ]
+    if not summaries:
+        return None
+    return max(summaries, key=lambda item: float(item[1].get("throughput_rps", 0.0)))
+
+
+def max_concurrency_under_p95_sla(
+    results: dict,
+    max_p95_ms: float,
+    max_error_pct: float = 1.0,
+) -> tuple[int, dict] | None:
+    """
+    Highest concurrency level where p95 latency is <= max_p95_ms and errors are within threshold.
+    """
+    if max_p95_ms <= 0:
+        return None
+    candidates: list[tuple[int, dict]] = []
+    for concurrency, summary in _iter_concurrency_summaries(results):
+        if summary.get("successful", 0) <= 0:
+            continue
+        if float(summary.get("error_rate_pct", 100.0)) > max_error_pct:
+            continue
+        lm = summary.get("latency_ms")
+        if not isinstance(lm, dict):
+            continue
+        p95 = float(lm.get("p95", float("inf")) or float("inf"))
+        if p95 <= max_p95_ms:
+            candidates.append((concurrency, summary))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])
+
+
+def _fastest_latency_summary(results: dict, max_error_pct: float = 1.0) -> tuple[int, dict] | None:
+    summaries = [
+        (concurrency, summary)
+        for concurrency, summary in _iter_concurrency_summaries(results)
+        if summary.get("successful", 0) > 0
+        and float(summary.get("error_rate_pct", 100.0)) <= max_error_pct
+        and isinstance(summary.get("latency_ms"), dict)
+    ]
+    if not summaries:
+        return None
+    return min(
+        summaries,
+        key=lambda item: (
+            float(item[1].get("latency_ms", {}).get("p95", float("inf")) or float("inf")),
+            float(item[1].get("latency_ms", {}).get("p50", float("inf")) or float("inf")),
+            -float(item[1].get("throughput_rps", 0.0) or 0.0),
+            item[0],
+        ),
+    )
+
+
 # ── Comparison matrix ─────────────────────────────────────────────────────────
 
 def _build_comparison_matrix(
@@ -147,8 +425,8 @@ def _build_comparison_matrix(
     if concurrency_levels is None:
         concurrency_levels = WHISPER_COMPARE_CONCURRENCY
 
-    backends = ["faster_whisper", "openai_whisper"]
-    b_label  = {"faster_whisper": "FW", "openai_whisper": "OW"}
+    backends = ["faster_whisper", "openai_whisper", "vllm_whisper"]
+    b_label  = {"faster_whisper": "FW", "openai_whisper": "OW", "vllm_whisper": "VW"}
 
     # Build column headers: model | FW c=1 | FW c=10 | FW c=50 | OW c=1 | …
     col_headers = ["Model"]
@@ -165,7 +443,12 @@ def _build_comparison_matrix(
                 if bm is None:
                     row.append("N/A")
                     continue
-                summary = _get(compare, b, bm, str(c))
+                model_results = _get(compare, b, bm)
+                if model_results == "—" or not isinstance(model_results, dict):
+                    row.append("—")
+                    continue
+                _, selected_results = _preferred_compute_results(model_results)
+                summary = _get(selected_results, str(c))
                 if summary == "—" or not isinstance(summary, dict):
                     row.append("—")
                     continue
@@ -191,22 +474,20 @@ def _build_vram_matrix(compare: dict) -> str:
     Values are known estimates — reported alongside measured GPU metrics.
     """
     vram_ref = {
-        # (display_name, faster_whisper_vram_gb, openai_whisper_vram_gb)
-        "tiny":            (0.15, 0.15),
-        "base":            (0.29, 0.29),
-        "small":           (0.93, 0.93),
-        "medium":          (3.06, 3.06),
-        "large (v1)":      (None, 6.17),
-        "large-v2":        (6.17, 6.17),
-        "large-v3":        (6.17, 6.17),
-        "turbo (lv3-t)":   (3.10, 3.10),   # large-v3-turbo ≈ 809 M params
+        # (display_name, faster_whisper_vram_gb, openai_whisper_vram_gb, vllm_whisper_vram_gb)
+        "medium":          (3.06, 3.06, 3.06),
+        "large-v3":        (6.17, 6.17, 6.17),
     }
     rows = []
-    for display, (fw_gb, ow_gb) in vram_ref.items():
+    for display, (fw_gb, ow_gb, vw_gb) in vram_ref.items():
         fw_str = f"~{fw_gb:.2f} GB" if fw_gb else "N/A"
         ow_str = f"~{ow_gb:.2f} GB" if ow_gb else "N/A"
-        rows.append([display, fw_str, ow_str])
-    return _md_table(["Model", "faster-whisper VRAM", "openai-whisper VRAM"], rows)
+        vw_str = f"~{vw_gb:.2f} GB+" if vw_gb else "N/A"
+        rows.append([display, fw_str, ow_str, vw_str])
+    return _md_table(
+        ["Model", "faster-whisper VRAM", "openai-whisper VRAM", "vLLM Whisper VRAM"],
+        rows,
+    )
 
 
 # ── Per-backend per-model detailed tables ─────────────────────────────────────
@@ -245,12 +526,16 @@ def generate_report(
     appointments_per_hour: float = 3.0,
     peak_factor: float = 1.5,
 ) -> str:
+    gpu_records = load_gpu_metrics(gpu_metrics_path)
+    gpu_summary = summarize_gpu_metrics(gpu_records)
+    gpu_label = _gpu_label(gpu_summary) if gpu_summary else "detected GPU"
+
     lines = [
-        "# H200 GPU Stress Test Report — Medical Ambient Scribing",
+        "# GPU Stress Test Report — Medical Ambient Scribing",
         "",
-        "> **GPU**: NVIDIA H200 141 GB HBM3e · **LLM**: ~20B model via vLLM  ",
-        "> **ASR backends**: faster-whisper (CTranslate2) vs openai-whisper (PyTorch)  ",
-        "> **Audio chunks**: 47 s · **Concurrency sweep**: 1 / 5 / 10 / 20 / 50 / 100",
+        f"> **GPU**: {gpu_label} · **LLM**: ~20B model via vLLM  ",
+        "> **ASR backends**: faster-whisper (CTranslate2) vs openai-whisper (PyTorch) vs vLLM Whisper  ",
+        f"> **Audio chunks**: 47 s · **Concurrency sweep**: {' / '.join(str(x) for x in WHISPER_COMPARE_CONCURRENCY)}",
         "",
         "---",
         "",
@@ -275,22 +560,9 @@ def generate_report(
     ]
 
     # ── GPU summary ───────────────────────────────────────────────────────────
-    gpu_records = load_gpu_metrics(gpu_metrics_path)
-    gpu_summary = summarize_gpu_metrics(gpu_records)
     lines.append("## GPU Resource Usage\n")
     if gpu_summary:
-        lines += [
-            _md_table(
-                ["Metric", "Peak", "Mean"],
-                [
-                    ["VRAM used (MiB)",     f"{gpu_summary['mem_used_mib']['max']:.0f}",  f"{gpu_summary['mem_used_mib']['mean']:.0f}"],
-                    ["GPU utilization (%)", f"{gpu_summary['gpu_util_pct']['max']:.1f}",  f"{gpu_summary['gpu_util_pct']['mean']:.1f}"],
-                    ["Power draw (W)",      f"{gpu_summary['power_w']['max']:.0f}",        f"{gpu_summary['power_w']['mean']:.0f}"],
-                    ["Temperature (°C)",    f"{gpu_summary['temp_c']['max']:.0f}",         f"{gpu_summary['temp_c']['mean']:.0f}"],
-                ],
-            ),
-            "",
-        ]
+        lines += [_gpu_summary_table(gpu_summary), ""]
     else:
         lines += ["_GPU metrics not available (run gpu_monitor sidecar)._\n"]
     lines.append("---\n")
@@ -299,7 +571,7 @@ def generate_report(
     compare = all_results.get("whisper_compare", {})
     lines.append("## Whisper Comparison Matrix\n")
     lines += [
-        "> **FW** = faster-whisper (CTranslate2)  |  **OW** = openai-whisper (PyTorch)  ",
+        "> **FW** = faster-whisper (CTranslate2)  |  **OW** = openai-whisper (PyTorch)  |  **VW** = vLLM Whisper  ",
         f"> Columns: concurrency = {WHISPER_COMPARE_CONCURRENCY} simultaneous 47-second audio chunks",
         "",
     ]
@@ -326,20 +598,23 @@ def generate_report(
 
     # Collect from both whisper_compare and whisper keys
     detailed_sources = []
-    if compare:
-        for backend, models in compare.items():
-            for model, results in models.items():
-                if isinstance(results, dict) and not results.get("error"):
-                    detailed_sources.append((backend, model, results))
-    elif all_results.get("whisper"):
-        w = all_results["whisper"]
-        for backend, models in w.items():
-            for model, results in models.items():
-                if isinstance(results, dict):
-                    detailed_sources.append((backend, model, results))
+    for result_set in _iter_whisper_result_sets(all_results):
+        model_label = result_set["model"]
+        if result_set.get("compute_type"):
+            model_label = f"{model_label} [{result_set['compute_type']}]"
+        if result_set.get("workers") is not None:
+            suffix = f"workers={result_set['workers']}"
+            if result_set.get("selected"):
+                suffix += ", selected"
+            model_label = f"{model_label} ({suffix})"
+        detailed_sources.append((result_set["backend"], model_label, result_set["results"]))
 
     if detailed_sources:
-        b_label = {"faster_whisper": "faster-whisper", "openai_whisper": "openai-whisper"}
+        b_label = {
+            "faster_whisper": "faster-whisper",
+            "openai_whisper": "openai-whisper",
+            "vllm_whisper": "vLLM Whisper",
+        }
         for backend, model, results in detailed_sources:
             lines += [
                 f"### {b_label.get(backend, backend)} · `{model}`",
@@ -357,8 +632,8 @@ def generate_report(
         "Per-instance VRAM footprint. H200 has 141 GB total.\n",
         _build_vram_matrix(compare),
         "",
-        "> faster-whisper (int8_float16): approximately half the FP16 VRAM above.  ",
-        "> H200 can hold ~22 large-v3 instances simultaneously (FP16) for maximum parallelism.",
+        "> faster-whisper (int8_float16): approximately half the FP16 VRAM above. vLLM adds scheduler/KV-cache overhead above model weights.  ",
+        "> Actual parallelism depends on the measured GPU VRAM, worker count, vLLM queue/cache settings, backend, and compute type.",
         "",
         "---\n",
     ]
@@ -477,7 +752,7 @@ def generate_report(
     lines.append("## End-to-End Pipeline\n")
     lines += [
         "> Mixed workload: 13 Whisper chunks (47 s each) → LLM SOAP note per session.  ",
-        "> VRAM split: LLM_GPU_UTIL=0.45 (~63 GB for LLM) + Whisper workers (~78 GB available)\n",
+        "> VRAM split depends on LLM_GPU_UTIL plus the Whisper worker count on this GPU.\n",
     ]
     e2e_results = all_results.get("e2e", {})
     measured_rps = 0.0
@@ -520,7 +795,7 @@ def generate_report(
             peak_factor=peak_factor,
         )
         lines += [
-            f"> Measured peak throughput: **{measured_rps:.3f} sessions/s** on 1× H200  ",
+            f"> Measured peak throughput: **{measured_rps:.3f} sessions/s** on 1 GPU  ",
             f"> Assumptions: **{appointments_per_hour} appt/hr per provider** · **{peak_factor}× peak burst**",
             "",
             _md_table(
@@ -579,6 +854,417 @@ def generate_report(
         "- **sessions/s**: Complete E2E sessions (all chunks + LLM note) per second.",
         "",
     ]
+
+    report = "\n".join(lines)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    return report
+
+
+def _projection_table(
+    throughput_rps_per_gpu: int | float,
+    target_tiers: list[int] | None = None,
+    headroom_factor: float = 1.0,
+) -> str:
+    rows = [
+        [
+            p["target_rps"],
+            f"{p['throughput_rps_per_gpu']:.3f}",
+            p["gpus_needed"],
+            f"{p['utilization_pct']:.1f}%",
+        ]
+        for p in project_rps_capacity(throughput_rps_per_gpu, target_tiers, headroom_factor=headroom_factor)
+    ]
+    col_measured = "Planning req/s/GPU" if headroom_factor < 0.999 else "Measured req/s/GPU"
+    return _md_table(["Target requests/s", col_measured, "GPUs needed", "Utilization"], rows)
+
+
+def generate_whisper_gpu_report(
+    all_results: dict,
+    gpu_metrics_path: str | Path,
+    output_path: str | Path,
+    target_tiers: list[int] | None = None,
+    max_error_pct: float = 1.0,
+    gpu_label_prefixes: list[str] | None = None,
+    report_title: str = "Whisper-Only GPU Capacity Report",
+    max_p95_ms: float | None = None,
+    headroom_factor: float | None = None,
+    load_mode_note: str | None = None,
+) -> str:
+    """Render a focused Whisper-only GPU capacity report."""
+    if max_p95_ms is None:
+        max_p95_ms = float(os.getenv("WHISPER_MAX_P95_MS") or 0.0)
+    if headroom_factor is None:
+        headroom_factor = float(os.getenv("WHISPER_PROJECTION_HEADROOM", "1.0"))
+    hf = max(float(headroom_factor), 0.001)
+    gpu_records = filter_gpu_metrics(load_gpu_metrics(gpu_metrics_path), gpu_label_prefixes)
+    gpu_summary = summarize_gpu_metrics(gpu_records)
+    result_sets = _iter_whisper_result_sets(all_results)
+
+    rows = []
+    throughput_candidates: list[dict] = []
+    latency_candidates: list[dict] = []
+    for result_set in result_sets:
+        peak = _peak_throughput_summary(result_set["results"], max_error_pct=max_error_pct)
+        fastest = _fastest_latency_summary(result_set["results"], max_error_pct=max_error_pct)
+        row_gpu_summary = summarize_gpu_metrics(
+            filter_gpu_metrics(gpu_records, [result_set.get("label_prefix", "")])
+        ) if result_set.get("label_prefix") else {}
+        if peak is None and fastest is None:
+            rows.append([
+                result_set["backend"],
+                result_set["model"],
+                result_set.get("compute_type") or "default",
+                result_set.get("workers") if result_set.get("workers") is not None else "—",
+                "yes" if result_set.get("selected", True) else "",
+                "0.00",
+                "—",
+                f"{row_gpu_summary.get('gpu_util_pct', {}).get('max', 0):.1f}" if row_gpu_summary else "—",
+                f"{row_gpu_summary.get('mem_used_mib', {}).get('max', 0):.0f}" if row_gpu_summary else "—",
+                "—",
+                "—",
+                "—",
+                "—",
+            ])
+            continue
+
+        peak_c, peak_summary = peak if peak else fastest
+        fastest_c, fastest_summary = fastest if fastest else peak
+        peak_lm = peak_summary.get("latency_ms", {})
+        fastest_lm = fastest_summary.get("latency_ms", {})
+        row = {
+            "backend": result_set["backend"],
+            "model": result_set["model"],
+            "compute_type": result_set.get("compute_type") or "default",
+            "workers": result_set.get("workers"),
+            "selected": result_set.get("selected", True),
+            "peak_concurrency": peak_c,
+            "peak_summary": peak_summary,
+            "fastest_concurrency": fastest_c,
+            "fastest_summary": fastest_summary,
+            "gpu_summary": row_gpu_summary,
+        }
+        rows.append([
+            row["backend"],
+            row["model"],
+            row["compute_type"],
+            row["workers"] if row["workers"] is not None else "—",
+            "yes" if row["selected"] else "",
+            f"{peak_summary.get('throughput_rps', 0):.2f}",
+            peak_c,
+            f"{row_gpu_summary.get('gpu_util_pct', {}).get('max', 0):.1f}" if row_gpu_summary else "—",
+            f"{row_gpu_summary.get('mem_used_mib', {}).get('max', 0):.0f}" if row_gpu_summary else "—",
+            _fmt_ms(peak_lm.get("p95")),
+            fastest_c,
+            _fmt_ms(fastest_lm.get("p95")),
+            f"{peak_summary.get('error_rate_pct', 0):.1f}%",
+        ])
+        if row["selected"] or row["workers"] is None:
+            throughput_candidates.append(row)
+            latency_candidates.append(row)
+
+    best_throughput: dict | None = None
+    for candidate in throughput_candidates:
+        if best_throughput is None or (
+            float(candidate["peak_summary"].get("throughput_rps", 0) or 0.0),
+            -float(candidate["peak_summary"].get("latency_ms", {}).get("p95", float("inf")) or float("inf")),
+        ) > (
+            float(best_throughput["peak_summary"].get("throughput_rps", 0) or 0.0),
+            -float(best_throughput["peak_summary"].get("latency_ms", {}).get("p95", float("inf")) or float("inf")),
+        ):
+            best_throughput = candidate
+
+    best_latency: dict | None = None
+    for candidate in latency_candidates:
+        if best_latency is None or (
+            float(candidate["fastest_summary"].get("latency_ms", {}).get("p95", float("inf")) or float("inf")),
+            -float(candidate["fastest_summary"].get("throughput_rps", 0) or 0.0),
+        ) < (
+            float(best_latency["fastest_summary"].get("latency_ms", {}).get("p95", float("inf")) or float("inf")),
+            -float(best_latency["fastest_summary"].get("throughput_rps", 0) or 0.0),
+        ):
+            best_latency = candidate
+
+    sla_table_rows: list[list[Any]] = []
+    if max_p95_ms > 0:
+        for result_set in result_sets:
+            res = result_set.get("results")
+            if not isinstance(res, dict):
+                continue
+            sla = max_concurrency_under_p95_sla(res, max_p95_ms, max_error_pct)
+            if not sla:
+                continue
+            sc, ss = sla
+            lm = ss.get("latency_ms", {}) or {}
+            sla_table_rows.append([
+                result_set["backend"],
+                result_set["model"],
+                str(result_set.get("compute_type") or "default"),
+                str(result_set.get("workers") if result_set.get("workers") is not None else "—"),
+                str(sc),
+                _fmt_ms(lm.get("p95")),
+                f"{ss.get('throughput_rps', 0):.2f}",
+                f"{ss.get('error_rate_pct', 0):.1f}%",
+            ])
+
+    methodology = [
+        f"> GPU: {_gpu_label(gpu_summary) if gpu_summary else 'GPU metrics unavailable'}",
+        "> Workload: concurrent 47-second audio chunk transcription requests.",
+        "> Planning basis: highest measured requests/second with error rate within threshold.",
+        "> Fastest response time is reported separately from max throughput so the latency/throughput tradeoff is visible.",
+        "> `Selected=yes` marks the chosen worker count for that backend/model/compute variant when worker sweep was used.",
+        "> External queues (e.g. Redis/RabbitMQ) are not simulated; results size GPU workers and safe in-flight concurrency.",
+    ]
+    if load_mode_note:
+        methodology.append(f"> Load generator: {load_mode_note}")
+    if hf < 0.999:
+        methodology.append(
+            f"> Projection uses planning headroom factor **{hf:g}** (effective req/s/GPU = measured × headroom)."
+        )
+
+    lines = [
+        f"# {report_title}",
+        "",
+        *methodology,
+        "",
+        "## GPU Resource Usage",
+        "",
+        _gpu_summary_table(gpu_summary),
+        "",
+        "## Whisper Results",
+        "",
+        _md_table(
+            [
+                "Backend",
+                "Model",
+                "Compute",
+                "Workers",
+                "Selected",
+                "Max req/s",
+                "Max req/s @ c",
+                "Peak GPU %",
+                "Peak VRAM MiB",
+                "Peak p95 ms",
+                "Fastest @ c",
+                "Fastest p95 ms",
+                "Peak error",
+            ],
+            rows,
+        ),
+        "",
+    ]
+
+    best_sla: list[Any] | None = None
+    if sla_table_rows:
+        # Prefer highest req/s, then lowest p95 among SLA-valid rows.
+        def _sla_sort_key(row: list[Any]) -> tuple[float, float]:
+            req_s = float(row[6]) if str(row[6]).replace(".", "", 1).isdigit() else 0.0
+            p95 = float(row[5]) if str(row[5]).replace(".", "", 1).isdigit() else float("inf")
+            return (req_s, -p95)
+
+        best_sla = max(sla_table_rows, key=_sla_sort_key)
+        lines += [
+            "## Latency SLA operating point",
+            "",
+            (
+                f"Highest concurrency level where **p95 ≤ {max_p95_ms:g} ms** "
+                f"and error rate ≤ {max_error_pct:g}% (per row)."
+            ),
+            "",
+            _md_table(
+                [
+                    "Backend",
+                    "Model",
+                    "Compute",
+                    "Workers",
+                    "Max c @ SLA",
+                    "p95 ms",
+                    "req/s",
+                    "Error",
+                ],
+                sla_table_rows,
+            ),
+            "",
+        ]
+        lines += [
+            "### Recommended operating point",
+            "",
+            (
+                f"`{best_sla[0]}` / `{best_sla[1]}` / `{best_sla[2]}` / workers `{best_sla[3]}` "
+                f"at concurrency **{best_sla[4]}** (p95 **{best_sla[5]} ms**, "
+                f"throughput **{best_sla[6]} req/s**, error **{best_sla[7]}**)."
+            ),
+            "",
+        ]
+
+    if best_throughput:
+        peak_lm = best_throughput["peak_summary"].get("latency_ms", {})
+        lines += [
+            "## Projection",
+            "",
+            (
+                f"Highest measured sustained throughput on this GPU: **{best_throughput['peak_summary'].get('throughput_rps', 0):.2f} req/s** "
+                f"at concurrency **{best_throughput['peak_concurrency']}** using "
+                f"`{best_throughput['backend']}` / `{best_throughput['model']}` / "
+                f"`{best_throughput['compute_type']}`"
+                + (
+                    f" / `workers={best_throughput['workers']}`."
+                    if best_throughput.get("workers") is not None else "."
+                )
+            ),
+            (
+                f"At that throughput point p95 latency was {_fmt_ms(peak_lm.get('p95'))} ms and error rate was "
+                f"{best_throughput['peak_summary'].get('error_rate_pct', 0):.1f}%."
+            ),
+            (
+                f"Observed GPU peak during that run: "
+                f"{best_throughput.get('gpu_summary', {}).get('gpu_util_pct', {}).get('max', 0):.1f}% util, "
+                f"{best_throughput.get('gpu_summary', {}).get('mem_used_mib', {}).get('max', 0):.0f} MiB VRAM."
+                if best_throughput.get("gpu_summary") else "Observed GPU metrics were not available for that run."
+            ),
+            "",
+        ]
+        if best_latency:
+            fastest_lm = best_latency["fastest_summary"].get("latency_ms", {})
+            lines += [
+                (
+                    f"Fastest measured response time: p95 **{_fmt_ms(fastest_lm.get('p95'))} ms** "
+                    f"at concurrency **{best_latency['fastest_concurrency']}** using "
+                    f"`{best_latency['backend']}` / `{best_latency['model']}` / `{best_latency['compute_type']}`"
+                    + (
+                        f" / `workers={best_latency['workers']}`."
+                        if best_latency.get("workers") is not None else "."
+                    )
+                ),
+                (
+                    f"At that latency point throughput was {best_latency['fastest_summary'].get('throughput_rps', 0):.2f} req/s "
+                    f"and error rate was {best_latency['fastest_summary'].get('error_rate_pct', 0):.1f}%."
+                ),
+                "",
+            ]
+        raw_rps = float(best_throughput["peak_summary"].get("throughput_rps", 0) or 0.0)
+        lines += [
+            _projection_table(raw_rps, target_tiers, headroom_factor=hf),
+            "",
+        ]
+        if hf < 0.999:
+            eff = raw_rps * hf
+            lines += [
+                f"Raw measured peak req/s (above): **{raw_rps:.3f}**; effective planning req/s/GPU: **{eff:.3f}** (× headroom {hf:g}).",
+                "",
+            ]
+        lines += [
+            "Assumption: horizontal scaling is roughly linear across identical GPUs and the same request mix.",
+            "Projection table uses effective req/s/GPU when headroom is below 1; otherwise measured req/s.",
+            "Batch-mode benchmarks can over- or under-state sustained utilization versus steady load; see load generator notes above.",
+            "",
+        ]
+    else:
+        lines += [
+            "## Projection",
+            "",
+            "_No valid Whisper throughput result was available, so GPU count projection was not generated._",
+            "",
+        ]
+
+    report = "\n".join(lines)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report)
+    return report
+
+
+def generate_vllm_gpu_report(
+    all_results: dict,
+    gpu_metrics_path: str | Path,
+    output_path: str | Path,
+    target_tiers: list[int] | None = None,
+    max_error_pct: float = 1.0,
+) -> str:
+    """Render a focused vLLM-only GPU capacity report."""
+    gpu_summary = summarize_gpu_metrics(load_gpu_metrics(gpu_metrics_path))
+    llm_results = all_results.get("llm") or {}
+
+    rows = []
+    for concurrency, summary in _iter_concurrency_summaries(llm_results):
+        lm = summary.get("latency_ms", {})
+        rows.append([
+            concurrency,
+            f"{summary.get('throughput_rps', 0):.3f}",
+            f"{summary.get('tokens_out_per_sec', 0):.0f}",
+            _fmt_ms(lm.get("p50")),
+            _fmt_ms(lm.get("p95")),
+            _fmt_ms(lm.get("p99")),
+            f"{summary.get('error_rate_pct', 0):.1f}%",
+        ])
+
+    peak = _peak_throughput_summary(llm_results, max_error_pct=max_error_pct)
+    fastest = _fastest_latency_summary(llm_results, max_error_pct=max_error_pct)
+
+    lines = [
+        "# vLLM GPU Capacity Report",
+        "",
+        f"> GPU: {_gpu_label(gpu_summary) if gpu_summary else 'GPU metrics unavailable'}",
+        "> Workload: OpenAI-compatible `/v1/chat/completions` requests against vLLM.",
+        "> Planning basis: highest measured requests/second with error rate within threshold.",
+        "> Fastest response time is reported separately from max throughput so the latency/throughput tradeoff is visible.",
+        "",
+        "## GPU Resource Usage",
+        "",
+        _gpu_summary_table(gpu_summary),
+        "",
+        "## vLLM Results",
+        "",
+        _md_table(["Concurrency", "req/s", "tok/s", "p50 ms", "p95 ms", "p99 ms", "Error"], rows),
+        "",
+    ]
+
+    if peak:
+        peak_c, peak_summary = peak
+        peak_lm = peak_summary.get("latency_ms", {})
+        lines += [
+            "## Projection",
+            "",
+            (
+                f"Highest measured sustained throughput on this GPU: **{peak_summary.get('throughput_rps', 0):.3f} req/s** "
+                f"at concurrency **{peak_c}**."
+            ),
+            (
+                f"At that throughput point p95 latency was {_fmt_ms(peak_lm.get('p95'))} ms and error rate was "
+                f"{peak_summary.get('error_rate_pct', 0):.1f}%."
+            ),
+            "",
+        ]
+        if fastest:
+            fastest_c, fastest_summary = fastest
+            fastest_lm = fastest_summary.get("latency_ms", {})
+            lines += [
+                (
+                    f"Fastest measured response time: p95 **{_fmt_ms(fastest_lm.get('p95'))} ms** "
+                    f"at concurrency **{fastest_c}**."
+                ),
+                (
+                    f"At that latency point throughput was {fastest_summary.get('throughput_rps', 0):.3f} req/s, "
+                    f"{fastest_summary.get('tokens_out_per_sec', 0):.0f} tok/s, "
+                    f"and error rate was {fastest_summary.get('error_rate_pct', 0):.1f}%."
+                ),
+                "",
+            ]
+        lines += [
+            _projection_table(peak_summary.get("throughput_rps", 0), target_tiers),
+            "",
+            "Assumption: horizontal scaling is roughly linear across identical GPUs and the same prompt/output mix.",
+            "Projection table is based on sustained requests/second, not in-flight concurrency.",
+            "",
+        ]
+    else:
+        lines += [
+            "## Projection",
+            "",
+            "_No valid vLLM throughput result was available, so GPU count projection was not generated._",
+            "",
+        ]
 
     report = "\n".join(lines)
     out = Path(output_path)

@@ -1,0 +1,153 @@
+{
+  "whisper": {
+    "vllm_whisper": {
+      "openai/whisper-large-v3": {
+        "8": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c8",
+          "wall_time_s": 79.353,
+          "total_requests": 376,
+          "successful": 376,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 4.7383,
+          "tokens_out_per_sec": 352.1,
+          "audio_realtime_factor": 222.7,
+          "latency_ms": {
+            "mean": 1640.7,
+            "p50": 254.0,
+            "p90": 5356.1,
+            "p95": 9644.0,
+            "p99": 9743.7,
+            "max": 10709.6,
+            "min": 155.8
+          },
+          "tokens_out_total": 27943,
+          "audio_seconds_total": 17672.0,
+          "concurrency": 8,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        },
+        "16": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c16",
+          "wall_time_s": 80.847,
+          "total_requests": 464,
+          "successful": 464,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 5.7393,
+          "tokens_out_per_sec": 427.9,
+          "audio_realtime_factor": 269.746,
+          "latency_ms": {
+            "mean": 2686.0,
+            "p50": 420.9,
+            "p90": 9101.9,
+            "p95": 15810.6,
+            "p99": 16240.2,
+            "max": 18114.0,
+            "min": 183.0
+          },
+          "tokens_out_total": 34598,
+          "audio_seconds_total": 21808.0,
+          "concurrency": 16,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        },
+        "20": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c20",
+          "wall_time_s": 81.57,
+          "total_requests": 494,
+          "successful": 494,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 6.0561,
+          "tokens_out_per_sec": 451.4,
+          "audio_realtime_factor": 284.638,
+          "latency_ms": {
+            "mean": 3170.1,
+            "p50": 480.8,
+            "p90": 10590.3,
+            "p95": 18782.3,
+            "p99": 19379.4,
+            "max": 21145.9,
+            "min": 172.1
+          },
+          "tokens_out_total": 36824,
+          "audio_seconds_total": 23218.0,
+          "concurrency": 20,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        },
+        "24": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c24",
+          "wall_time_s": 81.737,
+          "total_requests": 520,
+          "successful": 520,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 6.3619,
+          "tokens_out_per_sec": 472.1,
+          "audio_realtime_factor": 299.008,
+          "latency_ms": {
+            "mean": 3613.4,
+            "p50": 559.7,
+            "p90": 12315.3,
+            "p95": 21490.2,
+            "p99": 22268.8,
+            "max": 24265.2,
+            "min": 193.9
+          },
+          "tokens_out_total": 38584,
+          "audio_seconds_total": 24440.0,
+          "concurrency": 24,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        },
+        "32": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c32",
+          "wall_time_s": 83.219,
+          "total_requests": 564,
+          "successful": 564,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 6.7773,
+          "tokens_out_per_sec": 504.9,
+          "audio_realtime_factor": 318.534,
+          "latency_ms": {
+            "mean": 4488.7,
+            "p50": 684.4,
+            "p90": 15494.9,
+            "p95": 26471.4,
+            "p99": 28060.1,
+            "max": 29768.4,
+            "min": 213.7
+          },
+          "tokens_out_total": 42018,
+          "audio_seconds_total": 26508.0,
+          "concurrency": 32,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        }
+      }
+    }
+  }
+}

@@ -75,6 +75,23 @@ def _load_audio(audio_bytes: bytes) -> np.ndarray:
         return _load_via_ffmpeg(audio_bytes)
 
 
+def _prepare_audio(audio_input: bytes | np.ndarray) -> np.ndarray:
+    """
+    Normalize benchmark input to contiguous float32 mono audio at 16 kHz.
+
+    - bytes: decoded via soundfile/ffmpeg path
+    - numpy arrays: assumed already decoded, so we only coerce dtype/shape
+    """
+    if isinstance(audio_input, np.ndarray):
+        arr = audio_input
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32, copy=False)
+        return np.ascontiguousarray(arr)
+    return _load_audio(audio_input)
+
+
 # ── Base class ────────────────────────────────────────────────────────────────
 
 class BaseWhisperPool(ABC):
@@ -85,18 +102,18 @@ class BaseWhisperPool(ABC):
         self._executor   = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="whisper")
         self._available: asyncio.Queue = asyncio.Queue(maxsize=n_workers)
 
-    async def transcribe(self, audio_bytes: bytes, language: str = "en", beam_size: int = 5) -> dict:
+    async def transcribe(self, audio_input: bytes | np.ndarray, language: str = "en", beam_size: int = 5) -> dict:
         model = await self._available.get()
         loop  = asyncio.get_event_loop()
         try:
             return await loop.run_in_executor(
-                self._executor, self._infer, model, audio_bytes, language, beam_size
+                self._executor, self._infer, model, audio_input, language, beam_size
             )
         finally:
             await self._available.put(model)
 
     @abstractmethod
-    def _infer(self, model, audio_bytes: bytes, language: str, beam_size: int) -> dict: ...
+    def _infer(self, model, audio_input: bytes | np.ndarray, language: str, beam_size: int) -> dict: ...
 
     @property
     def active_workers(self) -> int:
@@ -127,8 +144,8 @@ class FasterWhisperPool(BaseWhisperPool):
             self._available.put_nowait(m)
         logger.info("FasterWhisperPool ready (%d workers)", n_workers)
 
-    def _infer(self, model, audio_bytes: bytes, language: str, beam_size: int) -> dict:
-        audio = _load_audio(audio_bytes)
+    def _infer(self, model, audio_input: bytes | np.ndarray, language: str, beam_size: int) -> dict:
+        audio = _prepare_audio(audio_input)
         segments, info = model.transcribe(
             audio, language=language, beam_size=beam_size,
             vad_filter=True,
@@ -146,9 +163,10 @@ class OpenAIWhisperPool(BaseWhisperPool):
     Models: tiny, base, small, medium, large, large-v1, large-v2, large-v3, turbo
     Note: 'turbo' is large-v3-turbo (809 M params); 'large' = large-v1.
     """
-    def __init__(self, model_size: str, n_workers: int, device: str):
+    def __init__(self, model_size: str, n_workers: int, device: str, fp16: bool = True):
         super().__init__(model_size, n_workers, device)
         import whisper as oai_whisper
+        self._fp16 = bool(fp16)
 
         # openai-whisper uses torch; each instance occupies its own VRAM slot
         # exactly as faster-whisper does.
@@ -164,15 +182,15 @@ class OpenAIWhisperPool(BaseWhisperPool):
             self._available.put_nowait(m)
         logger.info("OpenAIWhisperPool ready (%d workers)", n_workers)
 
-    def _infer(self, model, audio_bytes: bytes, language: str, beam_size: int) -> dict:
-        audio = _load_audio(audio_bytes)
+    def _infer(self, model, audio_input: bytes | np.ndarray, language: str, beam_size: int) -> dict:
+        audio = _prepare_audio(audio_input)
         # openai-whisper expects a 30-second padded mel internally;
         # passing a numpy array directly is supported since v20231117.
         result = model.transcribe(
             audio,
             language=language,
             beam_size=beam_size,
-            fp16=(self._device != "cpu"),
+            fp16=(self._fp16 and self._device != "cpu"),
         )
         duration = float(len(audio) / 16_000)
         return {
@@ -190,6 +208,7 @@ def create_pool(
     n_workers: int,
     device: str,
     compute_type: str = "float16",
+    openai_fp16: bool = True,
 ) -> BaseWhisperPool:
     """
     Factory that returns the right pool based on backend name.
@@ -204,6 +223,6 @@ def create_pool(
     if backend == "faster_whisper":
         return FasterWhisperPool(model_size, n_workers, device, compute_type)
     elif backend == "openai_whisper":
-        return OpenAIWhisperPool(model_size, n_workers, device)
+        return OpenAIWhisperPool(model_size, n_workers, device, fp16=openai_fp16)
     else:
         raise ValueError(f"Unknown backend: {backend!r}. Choose 'faster_whisper' or 'openai_whisper'.")

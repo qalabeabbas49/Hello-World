@@ -1,0 +1,42 @@
+{
+  "whisper": {
+    "vllm_whisper": {
+      "openai/whisper-large-v3": {
+        "56": {
+          "test_name": "whisper_vw_openai_whisper-large-v3_c56",
+          "wall_time_s": 87.519,
+          "total_requests": 655,
+          "successful": 655,
+          "failed": 0,
+          "error_rate_pct": 0.0,
+          "throughput_rps": 7.4841,
+          "tokens_out_per_sec": 555.0,
+          "audio_realtime_factor": 351.754,
+          "latency_ms": {
+            "mean": 6992.3,
+            "p50": 1187.8,
+            "p90": 24230.6,
+            "p95": 40614.5,
+            "p99": 42907.9,
+            "max": 44559.3,
+            "min": 186.9
+          },
+          "tokens_out_total": 48570,
+          "audio_seconds_total": 30785.0,
+          "concurrency": 56,
+          "load_mode": "steady",
+          "steady_state_duration_s": 75.0,
+          "backend": "vllm_whisper",
+          "model": "openai/whisper-large-v3",
+          "input_mode": "pcm_f32le",
+          "beam_size": 1
+        }
+      }
+    }
+  },
+  "whisper_compare": {},
+  "whisper_opt": {},
+  "llm": {},
+  "e2e": {},
+  "format": {}
+}

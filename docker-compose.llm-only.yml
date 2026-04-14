@@ -40,10 +40,17 @@ services:
     restart: unless-stopped
 
   gpu_monitor:
-    image: python:3.11-slim
-    command: python /monitor/gpu_monitor.py
+    build:
+      context: ./services/gpu_monitor
+    image: bench-gpu-monitor
+    command: python3 /monitor/gpu_monitor.py
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     network_mode: host
     privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices: [*gpu]
     volumes:
       - ./metrics:/monitor
       - ./results:/results

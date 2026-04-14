@@ -182,6 +182,22 @@ def generate_audio(
         return _to_opus(audio, sample_rate)
 
 
+def generate_audio_array(
+    duration_s: float = DEFAULT_DURATION_S,
+    seed: int = 0,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> np.ndarray:
+    """
+    Generate synthetic speech audio as a float32 mono numpy array.
+
+    This is useful for decode-free GPU benchmarks where we want to bypass
+    per-request container decoding/resampling overhead.
+    """
+    if sample_rate not in SUPPORTED_SAMPLE_RATES:
+        raise ValueError(f"Unsupported sample rate {sample_rate}. Choose from {SUPPORTED_SAMPLE_RATES}.")
+    return _synthesize(duration_s, sample_rate, seed)
+
+
 def generate_pool(
     count: int = 10,
     duration_s: float = DEFAULT_DURATION_S,
@@ -190,6 +206,27 @@ def generate_pool(
 ) -> list[bytes]:
     """Pre-generate `count` unique audio files for benchmark cycling."""
     return [generate_audio(duration_s=duration_s, seed=i, sample_rate=sample_rate, fmt=fmt) for i in range(count)]
+
+
+def generate_pool_decoded(
+    count: int = 10,
+    duration_s: float = DEFAULT_DURATION_S,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> list[np.ndarray]:
+    """Pre-generate `count` decoded float32 mono arrays for benchmark cycling."""
+    return [generate_audio_array(duration_s=duration_s, seed=i, sample_rate=sample_rate) for i in range(count)]
+
+
+def generate_pool_pcm_f32le(
+    count: int = 10,
+    duration_s: float = DEFAULT_DURATION_S,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+) -> list[bytes]:
+    """
+    Pre-generate `count` raw float32 little-endian PCM payloads for decode-free
+    Whisper benchmarks.
+    """
+    return [arr.astype(np.float32, copy=False).tobytes() for arr in generate_pool_decoded(count, duration_s, sample_rate)]
 
 
 def _content_type(fmt: str) -> str:

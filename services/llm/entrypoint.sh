@@ -22,7 +22,16 @@ DTYPE="${LLM_DTYPE:-float16}"
 
 echo "Starting vLLM: model=${MODEL}, gpu_util=${GPU_UTIL}, max_seqs=${MAX_NUM_SEQS}"
 
-exec python -m vllm.entrypoints.openai.api_server \
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+else
+  echo "No Python executable found in the vLLM image" >&2
+  exit 127
+fi
+
+exec "${PYTHON_BIN}" -m vllm.entrypoints.openai.api_server \
     --model                   "${MODEL}" \
     --max-model-len           "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization  "${GPU_UTIL}" \
